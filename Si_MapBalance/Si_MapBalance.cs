@@ -512,12 +512,12 @@ namespace Si_MapBalance
 
                 _activeConfig = config;
 
-                // For HvH: randomly swap Sol↔Cent positions for extra variation
+                // For HvH/HvHvA: randomly swap Sol↔Cent positions for extra variation
                 _swappedSolCent = false;
-                if (gameMode == "hvh" && UnityEngine.Random.Range(0, 2) == 1)
+                if ((gameMode == "hvh" || gameMode == "hvhva") && UnityEngine.Random.Range(0, 2) == 1)
                 {
                     _swappedSolCent = true;
-                    log.Msg("HvH: Swapping Sol ↔ Cent spawn positions");
+                    log.Msg($"{gameMode}: Swapping Sol ↔ Cent spawn positions");
                 }
 
                 log.Msg("SpawnBaseStructures: Overriding HQ positions from config");
