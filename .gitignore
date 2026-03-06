@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# C# build artifacts
+Si_MapBalance/bin/
+Si_MapBalance/obj/
+
+# Game DLL references (not redistributable)
+include/
+
+# Analysis data (not needed for web tool)
+data/
