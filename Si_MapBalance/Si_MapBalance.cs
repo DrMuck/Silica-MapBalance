@@ -1197,10 +1197,28 @@ namespace Si_MapBalance
                 }
                 else if (jsonFiles.Length > 0)
                 {
-                    // No mode-specific match — fall back to any config
-                    log.Warning($"No layouts match game mode '{gameMode}' — picking from all");
-                    int idx = jsonFiles.Length == 1 ? 0 : UnityEngine.Random.Range(0, jsonFiles.Length);
-                    configPath = jsonFiles[idx];
+                    // No mode-specific match — fall back to mode-agnostic configs only (no game_modes field)
+                    var agnostic = new List<string>();
+                    foreach (var file in jsonFiles)
+                    {
+                        try
+                        {
+                            var obj = JObject.Parse(File.ReadAllText(file));
+                            if (obj["game_modes"] == null)
+                                agnostic.Add(file);
+                        }
+                        catch { }
+                    }
+                    if (agnostic.Count > 0)
+                    {
+                        log.Warning($"No layouts match game mode '{gameMode}' — picking from {agnostic.Count} mode-agnostic layout(s)");
+                        int idx = agnostic.Count == 1 ? 0 : UnityEngine.Random.Range(0, agnostic.Count);
+                        configPath = agnostic[idx];
+                    }
+                    else
+                    {
+                        log.Warning($"No layouts match game mode '{gameMode}' and no mode-agnostic layouts — vanilla mode");
+                    }
                 }
             }
 
