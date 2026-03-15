@@ -1,5 +1,5 @@
 /*
- Si_MapBalance - v3.1.0 (Web Tool Integration)
+ Si_MapBalance - v3.2.0 (Web Tool Integration + !mapdump command)
 
  Per-map configuration:
  - Primary: reads layout JSONs from UserData/Spawns/{MapName}/*.json (web tool output)
@@ -27,7 +27,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.1.0", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.2.0", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -209,6 +209,12 @@ namespace Si_MapBalance
         private static bool _swappedSolCent;
         private static MethodInfo? _sendServerChatMethod;
 
+        // AdminMod integration
+        private static Type? _adminCallbackType;
+        private static Type? _adminPowerType;
+        private static MethodInfo? _registerAdminCmdMethod;
+        private static MethodInfo? _sendChatToPlayerMethod;
+
         // Resolved via reflection
         private static Type? _resourceAreaType;
         private static Type? _gameType;
@@ -238,7 +244,7 @@ namespace Si_MapBalance
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Si_MapBalance v3.1.0 loaded");
+            LoggerInstance.Msg("Si_MapBalance v3.2.0 loaded");
         }
 
         public override void OnLateInitializeMelon()
@@ -247,6 +253,7 @@ namespace Si_MapBalance
             CacheReflection();
             PatchDistributeAllResources();
             PatchSpawnBaseStructures();
+            RegisterAdminCommands();
         }
 
         private static void ResolveTypes()
@@ -447,6 +454,102 @@ namespace Si_MapBalance
 
             HarmonyInstance.Patch(spawnMethod, prefix: new HarmonyMethod(prefix));
             LoggerInstance.Msg("Patched SpawnBaseStructures (prefix, overrides HQ positions)");
+        }
+
+        private void RegisterAdminCommands()
+        {
+            try
+            {
+                Type? helperType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    helperType = asm.GetType("SilicaAdminMod.HelperMethods");
+                    if (helperType != null) break;
+                }
+                if (helperType == null)
+                {
+                    LoggerInstance.Warning("AdminMod not found — !mapdump command disabled");
+                    return;
+                }
+
+                _adminCallbackType = helperType.GetNestedType("CommandCallback", BindingFlags.Public);
+                if (_adminCallbackType == null)
+                    _adminCallbackType = helperType.Assembly.GetType("SilicaAdminMod.HelperMethods+CommandCallback");
+                _adminPowerType = helperType.Assembly.GetType("SilicaAdminMod.Power");
+                _registerAdminCmdMethod = helperType.GetMethod("RegisterAdminCommand", BindingFlags.Public | BindingFlags.Static);
+                _sendChatToPlayerMethod = helperType.GetMethod("SendChatMessageToPlayer", BindingFlags.Public | BindingFlags.Static);
+
+                if (_adminCallbackType == null || _registerAdminCmdMethod == null)
+                {
+                    LoggerInstance.Warning("Could not find CommandCallback or RegisterAdminCommand in AdminMod");
+                    return;
+                }
+
+                // Create DynamicMethod shim: void(Player, string) -> void(object, string)
+                var handler = typeof(MapBalance).GetMethod(nameof(OnMapdumpCommand), BindingFlags.NonPublic | BindingFlags.Static);
+                var dm = new System.Reflection.Emit.DynamicMethod(
+                    "MapdumpShim", typeof(void), new Type[] { typeof(Player), typeof(string) },
+                    typeof(MapBalance).Module, true);
+                var il = dm.GetILGenerator();
+                il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+                il.Emit(System.Reflection.Emit.OpCodes.Ldarg_1);
+                il.Emit(System.Reflection.Emit.OpCodes.Call, handler!);
+                il.Emit(System.Reflection.Emit.OpCodes.Ret);
+
+                object powerGeneric = Enum.ToObject(_adminPowerType!, 0x4000);
+                _registerAdminCmdMethod.Invoke(null, new object[] {
+                    "mapdump", dm.CreateDelegate(_adminCallbackType),
+                    powerGeneric, "Dump map info, refinery scans, and HQ scans to UserData/MapBalance/" });
+
+                LoggerInstance.Msg("Registered !mapdump admin command via AdminMod");
+            }
+            catch (Exception ex)
+            {
+                LoggerInstance.Warning($"Failed to register admin commands: {ex.Message}");
+            }
+        }
+
+        private static void OnMapdumpCommand(object player, string args)
+        {
+            var log = Melon<MapBalance>.Logger;
+            string mapName = GetCurrentMapName() ?? "unknown";
+
+            try
+            {
+                // Send chat feedback
+                string startMsg = $"[MapBalance] Starting full dump for {mapName}...";
+                _sendServerChatMethod?.Invoke(null, new object[] { startMsg });
+                log.Msg(startMsg);
+
+                // Reset dump guard so DumpMapInfo runs even if already dumped this round
+                _dumpedThisRound = false;
+
+                // 1. Resource area dump
+                DumpMapInfo();
+                log.Msg("DumpMapInfo complete");
+
+                // 2. Construction data dump
+                DumpConstructionData();
+                log.Msg("DumpConstructionData complete");
+
+                // 3. Refinery placement scans
+                ScanRefineryPlacements();
+                log.Msg("ScanRefineryPlacements complete");
+
+                // 4. HQ placement scans
+                ScanHQPlacements();
+                log.Msg("ScanHQPlacements complete");
+
+                string doneMsg = $"[MapBalance] Dump complete for {mapName} — files in UserData/MapBalance/";
+                _sendServerChatMethod?.Invoke(null, new object[] { doneMsg });
+                log.Msg(doneMsg);
+            }
+            catch (Exception ex)
+            {
+                string errMsg = $"[MapBalance] Dump failed: {ex.Message}";
+                _sendServerChatMethod?.Invoke(null, new object[] { errMsg });
+                log.Error($"!mapdump failed: {ex}");
+            }
         }
 
         // === Harmony Patches ===
