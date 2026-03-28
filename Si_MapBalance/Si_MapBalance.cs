@@ -183,11 +183,22 @@ namespace Si_MapBalance
         [JsonProperty("alienBiocacheChainRange")]
         public float AlienBiocacheChainRange = 0f;
 
+        // Wildlife (4-way) — same structure as Alien (nest + nodes + biocaches)
+        [JsonProperty("wildlifeBuildRadius")]
+        public float WildlifeBuildRadius = 0f;
+
+        [JsonProperty("wildlifeNodeChainRange")]
+        public float WildlifeNodeChainRange = 0f;
+
+        [JsonProperty("wildlifeBiocacheChainRange")]
+        public float WildlifeBiocacheChainRange = 0f;
+
         /// <summary>Get effective build radius for a faction.</summary>
         public float GetBuildRadius(string faction)
         {
             if (faction.Contains("Sol") && SolBuildRadius > 0) return SolBuildRadius;
             if (faction.Contains("Cent") && CentBuildRadius > 0) return CentBuildRadius;
+            if (faction.Contains("Wildlife") && WildlifeBuildRadius > 0) return WildlifeBuildRadius;
             return BuildRadius;
         }
 
@@ -196,6 +207,7 @@ namespace Si_MapBalance
         {
             if (faction.Contains("Sol") && SolChainRange > 0) return SolChainRange;
             if (faction.Contains("Cent") && CentChainRange > 0) return CentChainRange;
+            if (faction.Contains("Wildlife") && WildlifeNodeChainRange > 0) return WildlifeNodeChainRange;
             return ChainRange;
         }
     }
@@ -207,6 +219,13 @@ namespace Si_MapBalance
         private static MapConfig? _activeConfig;
         private static string _activeConfigName = "";
         private static bool _swappedSolCent;
+
+        /// <summary>
+        /// Public: Wildlife spawn position from the active 4way layout config.
+        /// Si_4way mod reads this via reflection to place the Wildlife nest.
+        /// Null = no Wildlife position configured (use map center fallback).
+        /// </summary>
+        public static float[] WildlifeSpawnPos = null;
         private static MethodInfo? _sendServerChatMethod;
 
         // AdminMod integration
@@ -589,14 +608,32 @@ namespace Si_MapBalance
                     }
                 }
 
+                // Check if Si_4way mod is active
+                bool is4way = false;
+                try
+                {
+                    var si4wayType = AppDomain.CurrentDomain.GetAssemblies()
+                        .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
+                        .FirstOrDefault(t => t.FullName == "Si_4way.Si_4way");
+                    if (si4wayType != null)
+                    {
+                        var field = si4wayType.GetField("Is4WayEnabled", BindingFlags.Public | BindingFlags.Static);
+                        if (field != null)
+                            is4way = (bool)(field.GetValue(null) ?? false);
+                    }
+                }
+                catch { }
+
                 string gameMode;
-                if (activeCount >= 3)
+                if (is4way)
+                    gameMode = "4way";
+                else if (activeCount >= 3)
                     gameMode = "hvhva";
                 else if (activeCount == 2 && hasAlien)
                     gameMode = "hva";
                 else
                     gameMode = "hvh";
-                log.Msg($"Detected game mode: {gameMode} ({activeCount} active teams, alien={hasAlien})");
+                log.Msg($"Detected game mode: {gameMode} ({activeCount} active teams, alien={hasAlien}, 4way={is4way})");
 
                 // Load config filtered by game mode
                 var config = LoadMapConfig(gameMode);
@@ -614,6 +651,22 @@ namespace Si_MapBalance
                 }
 
                 _activeConfig = config;
+
+                // Extract Wildlife spawn position for Si_4way mod (if present)
+                WildlifeSpawnPos = null;
+                if (is4way)
+                {
+                    var wildlifeSpawn = config.GetFactionSpawn("Wildlife", log);
+                    if (wildlifeSpawn != null)
+                    {
+                        WildlifeSpawnPos = new float[] { wildlifeSpawn.X, wildlifeSpawn.Z };
+                        log.Msg($"  Wildlife spawn from config: ({wildlifeSpawn.X:F0}, {wildlifeSpawn.Z:F0})");
+                    }
+                    else
+                    {
+                        log.Msg("  No Wildlife spawn in config — Si_4way will use map center");
+                    }
+                }
 
                 // For HvH/HvHvA: randomly swap Sol↔Cent positions for extra variation
                 _swappedSolCent = false;
@@ -670,7 +723,8 @@ namespace Si_MapBalance
                     // If swapped, Sol reads Cent's position and vice versa
                     string faction = teamName.Contains("Sol") ? "Sol"
                                    : teamName.Contains("Cent") ? "Cent"
-                                   : teamName.Contains("Alien") ? "Alien" : "";
+                                   : teamName.Contains("Alien") && !teamName.Contains("Worm") ? "Alien"
+                                   : (teamName.Contains("Worm") || teamName.Contains("Wildlife")) ? "Wildlife" : "";
                     string lookupFaction = faction;
                     if (_swappedSolCent)
                     {
