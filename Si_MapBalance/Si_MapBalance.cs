@@ -672,8 +672,28 @@ namespace Si_MapBalance
                 _swappedSolCent = false;
                 if ((gameMode == "hvh" || gameMode == "hvhva") && UnityEngine.Random.Range(0, 2) == 1)
                 {
-                    _swappedSolCent = true;
-                    log.Msg($"{gameMode}: Swapping Sol ↔ Cent spawn positions");
+                    // Terrain safety check: verify both swap-target positions are not near cliffs
+                    var solSpawn = config.GetFactionSpawn("Sol", log);
+                    var centSpawn = config.GetFactionSpawn("Cent", log);
+                    bool swapSafe = true;
+                    if (solSpawn != null && centSpawn != null)
+                    {
+                        // Check if Cent's position is safe for Sol HQ and vice versa
+                        // 30m radius, 15m max height difference threshold
+                        bool centPosSafe = IsPositionSafeForSwap(centSpawn.X, centSpawn.Z, 30f, 15f, log);
+                        bool solPosSafe = IsPositionSafeForSwap(solSpawn.X, solSpawn.Z, 30f, 15f, log);
+                        if (!centPosSafe || !solPosSafe)
+                        {
+                            swapSafe = false;
+                            log.Msg($"{gameMode}: Swap SKIPPED — terrain unsafe (Sol pos safe={solPosSafe}, Cent pos safe={centPosSafe})");
+                        }
+                    }
+
+                    if (swapSafe)
+                    {
+                        _swappedSolCent = true;
+                        log.Msg($"{gameMode}: Swapping Sol ↔ Cent spawn positions");
+                    }
                 }
 
                 log.Msg("SpawnBaseStructures: Overriding HQ positions from config");
@@ -2545,6 +2565,56 @@ namespace Si_MapBalance
             if (resObj != null)
                 return GetMemberValue<string>(resObj, "ResourceName") ?? "?";
             return "?";
+        }
+
+        /// <summary>
+        /// Check if a position is near a cliff (large terrain height variance nearby).
+        /// Samples terrain at center and 8 surrounding points; returns true if safe for HQ placement.
+        /// </summary>
+        private static bool IsPositionSafeForSwap(float worldX, float worldZ, float checkRadius, float maxHeightDiff, MelonLogger.Instance log)
+        {
+            float centerH = SampleTerrainHeightQuiet(worldX, worldZ);
+            if (float.IsNaN(centerH)) return true; // no terrain data, assume safe
+
+            float minH = centerH, maxH = centerH;
+            // Sample 8 points around the position
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = i * 45f * Mathf.Deg2Rad;
+                float sx = worldX + Mathf.Cos(angle) * checkRadius;
+                float sz = worldZ + Mathf.Sin(angle) * checkRadius;
+                float h = SampleTerrainHeightQuiet(sx, sz);
+                if (float.IsNaN(h)) continue;
+                if (h < minH) minH = h;
+                if (h > maxH) maxH = h;
+            }
+
+            float diff = maxH - minH;
+            bool safe = diff <= maxHeightDiff;
+            if (!safe)
+                log.Msg($"  Swap check FAILED at ({worldX:F0},{worldZ:F0}): height range {diff:F1}m (max allowed {maxHeightDiff:F0}m)");
+            return safe;
+        }
+
+        /// <summary>
+        /// Quiet version of SampleTerrainHeight (no logging). Returns NaN if no terrain found.
+        /// </summary>
+        private static float SampleTerrainHeightQuiet(float worldX, float worldZ)
+        {
+            foreach (var t in Terrain.activeTerrains)
+            {
+                var pos = t.transform.position;
+                var size = t.terrainData.size;
+                if (worldX >= pos.x && worldX <= pos.x + size.x &&
+                    worldZ >= pos.z && worldZ <= pos.z + size.z)
+                {
+                    return t.SampleHeight(new Vector3(worldX, 0f, worldZ)) + pos.y;
+                }
+            }
+            var fallback = Terrain.activeTerrain;
+            if (fallback != null)
+                return fallback.SampleHeight(new Vector3(worldX, 0f, worldZ)) + fallback.transform.position.y;
+            return float.NaN;
         }
 
         /// <summary>
