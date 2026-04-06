@@ -227,6 +227,7 @@ namespace Si_MapBalance
         /// </summary>
         public static float[] WildlifeSpawnPos = null;
         private static MethodInfo? _sendServerChatMethod;
+        private static MethodInfo? _printLogLineMethod;
 
         // AdminMod integration
         private static Type? _adminCallbackType;
@@ -425,6 +426,43 @@ namespace Si_MapBalance
                     null, new[] { typeof(string) }, null);
                 log.Msg($"SendServerChatMessage: {_sendServerChatMethod}");
             }
+
+            // HL_Logging.PrintLogLine(string, bool) — write to game log (UserData/logs/L*.log)
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var hlType = asm.GetType("HL_Logging");
+                    if (hlType != null)
+                    {
+                        _printLogLineMethod = hlType.GetMethod("PrintLogLine",
+                            BindingFlags.Public | BindingFlags.Static,
+                            null, new[] { typeof(string), typeof(bool) }, null);
+                        log.Msg($"PrintLogLine: {_printLogLineMethod}");
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"Could not resolve PrintLogLine: {ex.Message}");
+            }
+        }
+
+        private static void ResolvePrintLogLine()
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var hlType = asm.GetType("HL_Logging");
+                if (hlType != null)
+                {
+                    _printLogLineMethod = hlType.GetMethod("PrintLogLine",
+                        BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(bool) }, null);
+                    Melon<MapBalance>.Logger.Msg($"PrintLogLine (lazy resolve): {_printLogLineMethod}");
+                    break;
+                }
+            }
         }
 
         private void PatchDistributeAllResources()
@@ -576,6 +614,7 @@ namespace Si_MapBalance
         private static bool Prefix_SpawnBaseStructures(object __instance)
         {
             var log = Melon<MapBalance>.Logger;
+            bool anyHQSpawned = false;
 
             try
             {
@@ -765,6 +804,7 @@ namespace Si_MapBalance
                         float terrainY = SampleTerrainHeight(worldX, worldZ, log);
                         Vector3 targetPos = new Vector3(worldX, terrainY, worldZ);
 
+                        anyHQSpawned = true;
                         SpawnAtBestStartPoint(setup, team, startPoints, targetPos, usedPoints,
                             idxField, baseStructureField, baseStructureProp, log, teamName,
                             useExactPosition: true);
@@ -778,6 +818,7 @@ namespace Si_MapBalance
                         float dist = spawnRadius * UnityEngine.Random.Range(0.8f, 1.2f);
                         Vector3 target = mapCenter + new Vector3(Mathf.Sin(rad), 0f, Mathf.Cos(rad)) * dist;
 
+                        anyHQSpawned = true;
                         SpawnAtBestStartPoint(setup, team, startPoints, target, usedPoints,
                             idxField, baseStructureField, baseStructureProp, log, teamName,
                             useExactPosition: false);
@@ -792,6 +833,11 @@ namespace Si_MapBalance
             catch (Exception ex)
             {
                 log.Error($"SpawnBaseStructures override failed: {ex}");
+                if (anyHQSpawned)
+                {
+                    log.Warning("HQs were already spawned before the error — skipping original to prevent duplicates");
+                    return false;
+                }
                 return true;
             }
         }
@@ -912,11 +958,13 @@ namespace Si_MapBalance
                 return;
             }
 
-            // Game.SpawnPrefab(GameObject, Player, Team, Vector3, Quaternion, bool, bool)
+            // Game.SpawnPrefab(GameObject, Player, Team, Vector3, Quaternion, bool sendNetSpawn, bool sendNetInit)
+            // Pass sendNetSpawn=false to avoid crash if player disconnects during spawn.
+            // The game will sync structures to clients when the round starts.
             var paramCount = _spawnPrefabMethod.GetParameters().Length;
             object?[] args;
             if (paramCount >= 7)
-                args = new object?[] { prefab, null, team, position, rotation, true, true };
+                args = new object?[] { prefab, null, team, position, rotation, false, true };
             else if (paramCount >= 5)
                 args = new object?[] { prefab, null, team, position, rotation };
             else
@@ -962,13 +1010,19 @@ namespace Si_MapBalance
                 {
                     _dumpedThisRound = false;
 
-                    // Announce selected config in allchat
-                    if (_activeConfig != null && _sendServerChatMethod != null)
+                    // Announce selected config in allchat + game log
+                    if (_activeConfig != null)
                     {
                         string swap = _swappedSolCent ? " (swapped)" : "";
                         string msg = $"Map Balance: {_activeConfigName}{swap}";
-                        _sendServerChatMethod.Invoke(null, new object[] { msg });
+                        _sendServerChatMethod?.Invoke(null, new object[] { msg });
                         Melon<MapBalance>.Logger.Msg($"Allchat: {msg}");
+                        // Write to game log so MapReplay can pick it up
+                        // Lazy resolve: HL_Logging may not be loaded at init time
+                        if (_printLogLineMethod == null)
+                            ResolvePrintLogLine();
+                        string logLine = $"World triggered \"map_layout\" (layout \"{_activeConfigName}{swap}\")";
+                        _printLogLineMethod?.Invoke(null, new object[] { logLine, true });
                     }
                 }
                 catch (Exception ex)
