@@ -959,18 +959,27 @@ namespace Si_MapBalance
             }
 
             // Game.SpawnPrefab(GameObject, Player, Team, Vector3, Quaternion, bool sendNetSpawn, bool sendNetInit)
-            // Pass sendNetSpawn=false to avoid crash if player disconnects during spawn.
-            // The game will sync structures to clients when the round starts.
+            // sendNetSpawn must be true — clients need to know about the HQ.
+            // Wrap in try/catch: SpawnPrefab can throw if a player disconnects mid-spawn
+            // (SendNetSpawn iterates player list), but the HQ object is already created by then.
             var paramCount = _spawnPrefabMethod.GetParameters().Length;
             object?[] args;
             if (paramCount >= 7)
-                args = new object?[] { prefab, null, team, position, rotation, false, true };
+                args = new object?[] { prefab, null, team, position, rotation, true, true };
             else if (paramCount >= 5)
                 args = new object?[] { prefab, null, team, position, rotation };
             else
                 args = new object?[] { prefab, null, team, position, rotation };
 
-            _spawnPrefabMethod.Invoke(null, args);
+            try
+            {
+                _spawnPrefabMethod.Invoke(null, args);
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is ArgumentOutOfRangeException)
+            {
+                // Player disconnected during SendNetSpawn — HQ was already created, safe to continue
+                log.Warning($"SpawnPrefab network error (player disconnect during spawn): {ex.InnerException.Message}");
+            }
         }
 
         private static bool Prefix_DistributeAllResources(float resourceMultiplier, float disableAmount01)
