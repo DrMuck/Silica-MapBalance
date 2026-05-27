@@ -432,7 +432,7 @@ namespace Si_MapBalance
             {
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    var hlType = asm.GetType("HL_Logging");
+                    var hlType = asm.GetType("Si_Logging.HL_Logging");
                     if (hlType != null)
                     {
                         _printLogLineMethod = hlType.GetMethod("PrintLogLine",
@@ -453,7 +453,7 @@ namespace Si_MapBalance
         {
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                var hlType = asm.GetType("HL_Logging");
+                var hlType = asm.GetType("Si_Logging.HL_Logging");
                 if (hlType != null)
                 {
                     _printLogLineMethod = hlType.GetMethod("PrintLogLine",
@@ -801,8 +801,10 @@ namespace Si_MapBalance
                         // === Configured position: spawn at our coords ===
                         float worldX = spawnPos.X;
                         float worldZ = spawnPos.Z;
-                        float terrainY = SampleTerrainHeight(worldX, worldZ, log);
-                        Vector3 targetPos = new Vector3(worldX, terrainY, worldZ);
+                        // Use surface raycast (not raw terrain) so structure floors above the heightmap
+                        // (e.g. Industrial Quarter's steel-plated floor) are respected.
+                        float surfaceY = SampleSurfaceHeight(worldX, worldZ, log);
+                        Vector3 targetPos = new Vector3(worldX, surfaceY, worldZ);
 
                         anyHQSpawned = true;
                         SpawnAtBestStartPoint(setup, team, startPoints, targetPos, usedPoints,
@@ -841,6 +843,9 @@ namespace Si_MapBalance
                 return true;
             }
         }
+
+        // Vertical lift applied to the HQ structure spawn only (NOT the start point / starter units).
+        private const float HQ_SPAWN_HEIGHT_OFFSET = 5f;
 
         private static void SpawnAtBestStartPoint(object setup, object team,
             List<Transform>? startPoints, Vector3 target, List<Transform> usedPoints,
@@ -909,8 +914,15 @@ namespace Si_MapBalance
                 bestPoint.position = spawnPos;
             }
 
-            SpawnHQPrefab(prefab, team, spawnPos, rotation, log);
-            log.Msg($"  {teamName}: Spawned HQ at ({spawnPos.x:F0}, {spawnPos.z:F0}) — startPointIdx={bestIdx}");
+            // Raise only the HQ structure for HUMAN factions (Sol/Centauri). The alien Nest stays grounded.
+            // The start point (relocated above) and its starter units stay grounded for both factions.
+            bool isHumanFaction = prefab.GetComponent<HumanStructure>() != null;
+            Vector3 hqSpawnPos = isHumanFaction
+                ? spawnPos + new Vector3(0f, HQ_SPAWN_HEIGHT_OFFSET, 0f)
+                : spawnPos;
+            SpawnHQPrefab(prefab, team, hqSpawnPos, rotation, log);
+            string offsetTag = isHumanFaction ? $" [+{HQ_SPAWN_HEIGHT_OFFSET:F0}m]" : " [ground, alien]";
+            log.Msg($"  {teamName}: Spawned HQ at ({hqSpawnPos.x:F0}, {hqSpawnPos.y:F0}, {hqSpawnPos.z:F0}){offsetTag} — startPointIdx={bestIdx}");
         }
 
         private static object? GetTeamFromSetup(object setup)
@@ -2715,6 +2727,30 @@ namespace Si_MapBalance
 
             log.Warning($"  No terrain found for ({worldX:F0},{worldZ:F0}) — using Y=0");
             return 0f;
+        }
+
+        /// <summary>
+        /// Find the actual top playable surface Y at (worldX, worldZ). Most maps return the same
+        /// value as SampleTerrainHeight, but maps like Industrial Quarter have a structure floor
+        /// (e.g. "steel plated") that sits ABOVE the heightmap terrain — in that case the alien
+        /// Nest / human HQ must spawn on the floor, not on the hidden terrain below it.
+        /// Raycasts downward from above; falls back to terrain Y on miss.
+        /// </summary>
+        private static float SampleSurfaceHeight(float worldX, float worldZ, MelonLogger.Instance log)
+        {
+            float terrainY = SampleTerrainHeight(worldX, worldZ, log);
+            float rayStartY = terrainY + 200f; // start well above any plausible map floor structure
+            Vector3 rayStart = new Vector3(worldX, rayStartY, worldZ);
+            // Range covers 200m above + 200m below terrain. Ignore triggers so we don't catch zone volumes.
+            if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 400f, ~0, QueryTriggerInteraction.Ignore))
+            {
+                float dy = hit.point.y - terrainY;
+                string colName = hit.collider != null && hit.collider.gameObject != null ? hit.collider.gameObject.name : "?";
+                log.Msg($"  SurfaceHeight at ({worldX:F0},{worldZ:F0}): {hit.point.y:F1} (collider: {colName}, terrain={terrainY:F1}, Δ={dy:+0.0;-0.0;0})");
+                return hit.point.y;
+            }
+            log.Msg($"  SurfaceHeight at ({worldX:F0},{worldZ:F0}): raycast missed, using terrain Y={terrainY:F1}");
+            return terrainY;
         }
 
         private static Terrain? GetMainTerrain()
