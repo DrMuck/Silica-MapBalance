@@ -1,6 +1,8 @@
 # Si_MapBalance
 
-A server-side [Silica](https://store.steampowered.com/app/504900/Silica/) mod that overrides map spawn positions and resource distribution using layout configurations created with the [Map Balance Tool](https://github.com/DrMuck/Silica-MapBalanceTool).
+A server-side [Silica](https://store.steampowered.com/app/504900/Silica/) mod that overrides map spawn positions and resource distribution using layout configurations.
+
+> 🛠️ **Author layouts in the browser** with the interactive **[Map Balance Tool](https://drmuck.github.io/Silica-MapBalanceTool/)** — no install required, runs entirely client-side. Pick spawn positions on the map image, place resource patches, tag layouts by game mode, then export ready-to-deploy JSONs straight into `UserData/Spawns/`. Tool source: [github.com/DrMuck/Silica-MapBalanceTool](https://github.com/DrMuck/Silica-MapBalanceTool).
 
 Maps without a configuration run fully vanilla — no changes to spawns or resources.
 
@@ -18,7 +20,19 @@ Maps without a configuration run fully vanilla — no changes to spawns or resou
 
 ### 1. Create layouts with the Map Balance Tool
 
-Use the interactive [Map Balance Tool](https://github.com/DrMuck/Silica-MapBalanceTool) to plan spawn positions and resource distribution for each map. The tool outputs JSON files like:
+Open **[Map Balance Tool](https://drmuck.github.io/Silica-MapBalanceTool/)** in your browser. It's a single-page web app — no install, no account, all editing happens locally — that lets you:
+
+- Pick a Silica map background image
+- Click-place HQ / Nest spawn positions for each faction
+- Define resource patches with per-type amounts (Balterium / Biotics)
+- Remove specific in-map resource patches
+- Tag the layout with game-mode flags (`hvh`, `hva`, `hvhva`, optionally `4way`)
+- Set per-faction settings (build radius, chain range, etc.)
+- Export ready-to-deploy JSON files
+
+Tool source: [github.com/DrMuck/Silica-MapBalanceTool](https://github.com/DrMuck/Silica-MapBalanceTool).
+
+Output filenames the tool typically produces:
 
 ```
 layout_Badlands_HvH.json
