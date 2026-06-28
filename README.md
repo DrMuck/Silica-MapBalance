@@ -4,6 +4,10 @@ A server-side [Silica](https://store.steampowered.com/app/504900/Silica/) mod th
 
 > 🛠️ **Author layouts in the browser** with the interactive **[Map Balance Tool](https://drmuck.github.io/Silica-MapBalanceTool/)** — no install required, runs entirely client-side. Pick spawn positions on the map image, place resource patches, tag layouts by game mode, then export ready-to-deploy JSONs straight into `UserData/Spawns/`. Tool source: [github.com/DrMuck/Silica-MapBalanceTool](https://github.com/DrMuck/Silica-MapBalanceTool).
 
+![Map Balance Tool — Badlands with placed HQs and build-radius rings](docs/screenshots/map_balance_tool_badlands.jpg)
+
+*Screenshot from the [interactive tool](https://drmuck.github.io/Silica-MapBalanceTool/): Badlands map with Sol (blue), Centauri (red), and Alien (green) bases placed; dashed rings show each faction's **build radius**. The build radius value can be tuned per-faction in [Si_UnitBalance](https://github.com/DrMuck/Silica-UnitBalance) (via the `build_radius` parameter under each HQ entry in `Si_UnitBalance_Config.json`, or live through the `!b` editor).*
+
 Maps without a configuration run fully vanilla — no changes to spawns or resources.
 
 ## Features
