@@ -59,6 +59,16 @@ namespace Si_MapBalance
         [JsonProperty("game_modes")]
         public JToken? GameModes;
 
+        // Single King of the Hill tower spawn (null = not configured for this map).
+        // Consumed by Si_KingOfTheHill mod via MapBalanceSpecials.
+        [JsonProperty("koh")]
+        public KohEntry? Koh;
+
+        // Zero or more Fusion Reactor spawns. Consumed by databomb's reactor mod
+        // via MapBalanceSpecials.
+        [JsonProperty("fusion_reactors")]
+        public List<FusionReactorEntry>? FusionReactors;
+
         /// <summary>
         /// Extract spawn position for a faction, handling both formats:
         /// Web tool:  "Sol": [{"x":-2070,"z":2295,"isSpawn":false,...}]
@@ -153,6 +163,28 @@ namespace Si_MapBalance
 
         [JsonProperty("type")]
         public string Type = "balterium";
+    }
+
+    // Single KoH tower placement. Default prefab is Sol_UltraHeavyFactory — a real networked
+    // structure that replicates to clients (unlike Fortress_LargeTower_01 which has no
+    // NetworkComponent and was destroyed by Game.SpawnPrefab on the server side).
+    // Si_KingOfTheHill applies damage immunity + handles team-color switching on capture.
+    public class KohEntry
+    {
+        [JsonProperty("x")] public float X;
+        [JsonProperty("z")] public float Z;
+        [JsonProperty("capture_radius")] public float CaptureRadius = 50f;
+        [JsonProperty("exclusion_radius")] public float ExclusionRadius = 75f;
+        [JsonProperty("prefab")] public string PrefabName = "Sol_UltraHeavyFactory";
+    }
+
+    // One Fusion Reactor placement. Multiple per map allowed.
+    public class FusionReactorEntry
+    {
+        [JsonProperty("x")] public float X;
+        [JsonProperty("z")] public float Z;
+        [JsonProperty("capture_radius")] public float CaptureRadius = 40f;
+        [JsonProperty("prefab")] public string PrefabName = "FusionReactor_01";
     }
 
     public class SettingsConfig
@@ -1044,6 +1076,10 @@ namespace Si_MapBalance
                             ResolvePrintLogLine();
                         string logLine = $"World triggered \"map_layout\" (layout \"{_activeConfigName}{swap}\")";
                         _printLogLineMethod?.Invoke(null, new object[] { logLine, true });
+
+                        // Spawn KoH tower + Fusion Reactors (if configured for this map).
+                        try { SpawnSpecials(_activeConfig, Melon<MapBalance>.Logger); }
+                        catch (Exception ex) { Melon<MapBalance>.Logger.Error($"SpawnSpecials failed: {ex}"); }
                     }
                 }
                 catch (Exception ex)
@@ -1063,6 +1099,7 @@ namespace Si_MapBalance
                 _activeConfigName = "";
                 _swappedSolCent = false;
                 CleanupSpawnedAreas();
+                MapBalanceSpecials.Clear();
             }
         }
 
@@ -1419,33 +1456,40 @@ namespace Si_MapBalance
             if (Directory.Exists(mapSpawnsDir))
             {
                 var jsonFiles = Directory.GetFiles(mapSpawnsDir, "*.json");
-                // Filter by game_modes if available
+                // Filter by game_modes if available. Also track which matching layouts have
+                // a "koh" block — Si_KingOfTheHill, if loaded, asks us to prefer those.
                 var matching = new List<string>();
+                var matchingWithKoh = new List<string>();
                 foreach (var file in jsonFiles)
                 {
                     try
                     {
                         var obj = JObject.Parse(File.ReadAllText(file));
                         var modes = obj["game_modes"];
-                        if (modes == null)
-                        {
-                            // No game_modes field → accept for any mode
-                            matching.Add(file);
-                        }
-                        else if (modes[gameMode]?.Value<bool>() == true)
-                        {
-                            matching.Add(file);
-                        }
+                        bool modeOk = modes == null || modes[gameMode]?.Value<bool>() == true;
+                        if (!modeOk) continue;
+
+                        matching.Add(file);
+                        var koh = obj["koh"];
+                        if (koh != null && koh.Type == JTokenType.Object)
+                            matchingWithKoh.Add(file);
                     }
                     catch { }
                 }
 
-                log.Msg($"Found {jsonFiles.Length} layouts for {mapName}, {matching.Count} match game mode '{gameMode}'");
+                log.Msg($"Found {jsonFiles.Length} layouts for {mapName}, {matching.Count} match game mode '{gameMode}' ({matchingWithKoh.Count} with KoH)");
 
                 if (matching.Count > 0)
                 {
-                    int idx = matching.Count == 1 ? 0 : UnityEngine.Random.Range(0, matching.Count);
-                    configPath = matching[idx];
+                    // Prefer KoH layouts when the KoH mod is loaded and at least one matching layout has 'koh'.
+                    var pool = matching;
+                    if (matchingWithKoh.Count > 0 && IsKohModLoaded())
+                    {
+                        log.Msg($"KoH mod active — preferring {matchingWithKoh.Count}/{matching.Count} layouts with 'koh' field");
+                        pool = matchingWithKoh;
+                    }
+                    int idx = pool.Count == 1 ? 0 : UnityEngine.Random.Range(0, pool.Count);
+                    configPath = pool[idx];
                 }
                 else if (jsonFiles.Length > 0)
                 {
@@ -2825,6 +2869,402 @@ namespace Si_MapBalance
                 }
             }
             return result;
+        }
+
+        // ============================================================
+        //  Specials: KoH tower + Fusion Reactors
+        //  Spawned from layout JSON, exposed via MapBalanceSpecials.
+        // ============================================================
+
+        private static void SpawnSpecials(MapConfig config, MelonLogger.Instance log)
+        {
+            // Clear any state from a prior round (also done in OnGameEnded; defensive).
+            MapBalanceSpecials.Clear();
+
+            int paramCount = _spawnPrefabMethod?.GetParameters().Length ?? 0;
+            if (paramCount == 0)
+            {
+                log.Warning("[Specials] Game.SpawnPrefab not resolved — skipping KoH/FusionReactor spawn");
+                return;
+            }
+
+            // KoH (single).
+            if (config.Koh != null)
+            {
+                // Find a neutral team BEFORE spawning. Passing the team into Game.SpawnPrefab
+                // sets it before the NetworkComponent.SendNetSpawn packet goes out, so clients
+                // see the correct team-color from the moment the building appears. Post-spawn
+                // team mutation is server-only and doesn't replicate.
+                object? neutralTeam = FindNeutralTeam(log);
+
+                var go = SpawnSpecialAt(config.Koh.PrefabName, config.Koh.X, config.Koh.Z, paramCount, log, "KoH", neutralTeam);
+                if (go != null)
+                {
+                    MapBalanceSpecials.Koh = new MapBalanceSpecials.KohEntry {
+                        Obj = go,
+                        CaptureRadius = config.Koh.CaptureRadius,
+                        ExclusionRadius = config.Koh.ExclusionRadius,
+                    };
+                    log.Msg($"[Specials] KoH spawned: {go.name} at ({config.Koh.X:F0},{config.Koh.Z:F0}) " +
+                            $"R_capture={config.Koh.CaptureRadius} R_excl={config.Koh.ExclusionRadius}");
+                }
+            }
+
+            // Fusion Reactors (zero or more).
+            if (config.FusionReactors != null)
+            {
+                int i = 0;
+                foreach (var fr in config.FusionReactors)
+                {
+                    var go = SpawnSpecialAt(fr.PrefabName, fr.X, fr.Z, paramCount, log, $"FR#{i}");
+                    if (go != null)
+                    {
+                        MapBalanceSpecials.FusionReactors.Add(new MapBalanceSpecials.FusionReactorEntry {
+                            Obj = go,
+                            CaptureRadius = fr.CaptureRadius,
+                        });
+                        log.Msg($"[Specials] FusionReactor#{i} spawned: {go.name} at ({fr.X:F0},{fr.Z:F0}) R_capture={fr.CaptureRadius}");
+                    }
+                    i++;
+                }
+            }
+
+            // Notify consumer mods.
+            try { MapBalanceSpecials.RaiseReady(); }
+            catch (Exception ex) { log.Warning($"[Specials] OnSpecialsReady subscriber threw: {ex.Message}"); }
+        }
+
+        private static GameObject? SpawnSpecialAt(string prefabName, float tx, float tz, int paramCount, MelonLogger.Instance log, string label, object? team = null)
+        {
+            // Find prefab. GameDatabase.GetSpawnablePrefab covers structures; fall back to a scene-wide search for static props.
+            var prefab = GetResourcePrefab(prefabName, log);
+            if (prefab == null) prefab = FindPrefabByName(prefabName, log);
+            if (prefab == null)
+            {
+                log.Warning($"[Specials/{label}] prefab '{prefabName}' not found — cannot spawn");
+                return null;
+            }
+
+            float ty = SampleSurfaceHeight(tx, tz, log);
+            var pos = new Vector3(tx, ty, tz);
+            var rot = Quaternion.identity;
+
+            // 1) Try the game's networked SpawnPrefab. Passing 'team' here is critical —
+            //    Game.SpawnPrefab sets BaseGameObject.Team BEFORE NetworkComponent.SendNetSpawn,
+            //    so clients see the correct team-color from the moment the building appears.
+            //    Mutation after this call is server-only and does NOT replicate.
+            GameObject? go = null;
+            try
+            {
+                object?[] args = paramCount >= 7
+                    ? new object?[] { prefab, null, team, pos, rot, true, true }
+                    : new object?[] { prefab, null, team, pos, rot };
+                go = _spawnPrefabMethod!.Invoke(null, args) as GameObject;
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"[Specials/{label}] SpawnPrefab threw at ({tx:F0},{tz:F0}): {ex.Message} — trying direct Instantiate");
+            }
+
+            if (go != null)
+            {
+                log.Msg($"[Specials/{label}] networked spawn OK (clients should see).");
+                return go;
+            }
+
+            // 2) Fallback: direct Unity Instantiate. Required for static visual props like
+            //    Fortress_LargeTower_01 which the game refuses to network-spawn (no
+            //    NetworkComponent / Structure). Result is server-only — clients won't render
+            //    the tower, but capture-zone logic is server-authoritative anyway.
+            try
+            {
+                go = UnityEngine.Object.Instantiate(prefab, pos, rot);
+                log.Msg($"[Specials/{label}] direct Instantiate at ({tx:F0},{tz:F0}) — server-only marker (clients won't see tower).");
+                return go;
+            }
+            catch (Exception ex)
+            {
+                log.Error($"[Specials/{label}] Instantiate threw at ({tx:F0},{tz:F0}): {ex.Message}");
+                return null;
+            }
+        }
+
+        // Case-insensitive Contains for plain strings (avoids LINQ in the hot path).
+        private static bool ContainsCI(string haystack, string needle)
+            => !string.IsNullOrEmpty(haystack) && haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        // Find a "neutral" team object by iterating Silica's Teams collection. Looks for
+        // AlienWorms (wildlife) first, then Gamemaster as fallback. Returns null if neither
+        // is present — caller will then leave the prefab's DefaultTeam.
+        // Must be called BEFORE Game.SpawnPrefab so the team can be replicated via SendNetSpawn.
+        private static object? FindNeutralTeam(MelonLogger.Instance log)
+        {
+            try
+            {
+                if (_teamType == null) { log.Warning("[Specials/KoH] Team type not resolved — cannot find neutral team"); return null; }
+                var teamsProp = _teamType.GetProperty("Teams", BindingFlags.Public | BindingFlags.Static);
+                var teamsField = _teamType.GetField("Teams", BindingFlags.Public | BindingFlags.Static);
+                var teamsVal = teamsProp?.GetValue(null) ?? teamsField?.GetValue(null);
+                if (!(teamsVal is System.Collections.IEnumerable teamList)) return null;
+
+                var shortField = _teamType.GetField("TeamShortName", BindingFlags.Public | BindingFlags.Instance);
+
+                // Priority: Gamemaster first (admin/observer team — AI generally doesn't target
+                // it and no other entities live on it). Wildlife as fallback (but AI targets it
+                // and we'd have to broadly allied-flip Wildlife in KoH, which breaks 4-way mode).
+                var teamNameField = _teamType.GetField("TeamName", BindingFlags.Public | BindingFlags.Instance);
+                object? master = null;
+                object? worm = null;
+                int idx = 0;
+                foreach (var t in teamList)
+                {
+                    if (t == null) { log.Msg($"[Specials/KoH] Team[{idx++}] = <null>"); continue; }
+                    string shortName = (shortField?.GetValue(t) as string) ?? "";
+                    string fullName = (teamNameField?.GetValue(t) as string) ?? "";
+                    string goName = (t as Component)?.name ?? "";
+                    // Log every candidate so we can see exactly what's there.
+                    log.Msg($"[Specials/KoH] Team[{idx++}]: short='{shortName}', name='{fullName}', go='{goName}'");
+
+                    bool isMaster = ContainsCI(shortName, "Master") || ContainsCI(fullName, "Master") || ContainsCI(goName, "Master");
+                    bool isWild = ContainsCI(shortName, "Worm") || ContainsCI(shortName, "Wildlife")
+                               || ContainsCI(fullName, "Worm") || ContainsCI(fullName, "Wildlife")
+                               || ContainsCI(goName, "Worm") || ContainsCI(goName, "Wildlife");
+                    if (isMaster && master == null) master = t;
+                    else if (isWild && worm == null) worm = t;
+                }
+                // Wildlife is the proven-working choice: damage immunity holds, AI ignores it
+                // (Si_KingOfTheHill's GetTeamsAreEnemy postfix matches Wildlife as always-allied).
+                // Gamemaster ended up letting damage through in practice — kept as fallback only.
+                if (worm   != null) { log.Msg("[Specials/KoH] Picked: Wildlife"); return worm; }
+                if (master != null) { log.Msg("[Specials/KoH] Picked: Gamemaster (fallback)"); return master; }
+                log.Warning("[Specials/KoH] No wildlife/gamemaster team found in Teams collection");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"[Specials/KoH] FindNeutralTeam threw: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Diagnostic: log all loaded teams so we can see what names exist at runtime.
+        // Cached — only logs once per session.
+        private static bool _teamsLogged;
+        private static void LogAvailableTeams(MelonLogger.Instance log)
+        {
+            if (_teamsLogged || _teamType == null) return;
+            try
+            {
+                // Try common static accessors for the master team list.
+                foreach (var name in new[] { "Teams", "AllTeams", "TeamsList" })
+                {
+                    var prop = _teamType.GetProperty(name, BindingFlags.Public | BindingFlags.Static);
+                    var field = _teamType.GetField(name, BindingFlags.Public | BindingFlags.Static);
+                    var val = prop?.GetValue(null) ?? field?.GetValue(null);
+                    if (val is System.Collections.IEnumerable e)
+                    {
+                        var names = new System.Collections.Generic.List<string>();
+                        foreach (var t in e)
+                        {
+                            if (t == null) { names.Add("<null>"); continue; }
+                            var n = t.GetType().GetProperty("Name", BindingFlags.Public | BindingFlags.Instance)?.GetValue(t)?.ToString()
+                                ?? (t as Component)?.name ?? t.ToString();
+                            names.Add(n ?? "?");
+                        }
+                        log.Msg($"[Specials/KoH] Teams (via {name}): [{string.Join(", ", names)}]");
+                        _teamsLogged = true;
+                        return;
+                    }
+                }
+                log.Msg("[Specials/KoH] Could not enumerate Teams list (no Teams/AllTeams/TeamsList static)");
+                _teamsLogged = true;
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"[Specials/KoH] LogAvailableTeams threw: {ex.Message}");
+                _teamsLogged = true;
+            }
+        }
+
+        // Post-spawn team flip for the KoH building. Tries real "non-owning" teams (Wildlife,
+        // Worm, Neutral, None) before falling back to null. If all fail, leaves DefaultTeam.
+        private static void TryMakeNeutral(GameObject go, MelonLogger.Instance log)
+        {
+            try
+            {
+                if (_teamType == null) { log.Warning("[Specials/KoH] Team type not resolved — leaving default team"); return; }
+                var baseType = _teamType.Assembly.GetType("BaseGameObject");
+                if (baseType == null) { log.Warning("[Specials/KoH] BaseGameObject type not found — leaving default team"); return; }
+                var bgo = go.GetComponent(baseType);
+                if (bgo == null)
+                {
+                    // BaseGameObject may live on a child of the prefab root.
+                    bgo = go.GetComponentInChildren(baseType, includeInactive: true);
+                }
+                if (bgo == null) { log.Warning("[Specials/KoH] BaseGameObject not on building — leaving default team"); return; }
+
+                var teamProp = baseType.GetProperty("Team", BindingFlags.Public | BindingFlags.Instance);
+                if (teamProp == null) { log.Warning("[Specials/KoH] BaseGameObject.Team property not found"); return; }
+
+                // Setting Team = null doesn't actually neutralize the building (the structure
+                // falls back to DefaultTeam = Sol for production etc.). Try real teams first.
+                var getByName = _teamType.GetMethod("GetTeamByName", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+
+                // Diagnostic: enumerate all known teams once so we know what's actually available.
+                LogAvailableTeams(log);
+
+                // Team.GetTeamByName looks up TeamShortName, NOT the GameObject name.
+                // The team enumeration we logged shows GameObject names like "Team_Gamemaster".
+                // To avoid guessing the short name, iterate the Teams collection directly and
+                // pick the one whose TeamShortName matches our priority list.
+                object? pickedTeam = null;
+                string pickedName = "";
+                var teamsProp2 = _teamType.GetProperty("Teams", BindingFlags.Public | BindingFlags.Static);
+                var teamsField = _teamType.GetField("Teams", BindingFlags.Public | BindingFlags.Static);
+                var teamsVal = teamsProp2?.GetValue(null) ?? teamsField?.GetValue(null);
+                var shortField = _teamType.GetField("TeamShortName", BindingFlags.Public | BindingFlags.Instance);
+                var teamNameField = _teamType.GetField("TeamName", BindingFlags.Public | BindingFlags.Instance);
+                if (teamsVal is System.Collections.IEnumerable teamList && shortField != null)
+                {
+                    foreach (var t in teamList)
+                    {
+                        if (t == null) continue;
+                        string shortName = (shortField.GetValue(t) as string) ?? "";
+                        string fullName = (teamNameField?.GetValue(t) as string) ?? "";
+                        string goName = (t as Component)?.name ?? "";
+                        log.Msg($"[Specials/KoH] Team candidate: short='{shortName}', name='{fullName}', go='{goName}'");
+
+                        // Priority: Gamemaster > AlienWorms / Wildlife > Worm > anything not Sol/Cent/Alien
+                        bool isGM = ContainsCI(shortName, "Master") || ContainsCI(goName, "Master");
+                        bool isWildlife = ContainsCI(shortName, "Worm") || ContainsCI(shortName, "Wildlife") ||
+                                          ContainsCI(goName, "Worm") || ContainsCI(goName, "Wildlife");
+                        if (isGM && pickedTeam == null) { pickedTeam = t; pickedName = $"{shortName}|{goName}"; }
+                        else if (isWildlife && pickedTeam == null) { pickedTeam = t; pickedName = $"{shortName}|{goName}"; }
+                    }
+                }
+
+                if (pickedTeam != null)
+                {
+                    try
+                    {
+                        teamProp.SetValue(bgo, pickedTeam);
+                        log.Msg($"[Specials/KoH] Team set to {pickedName} (via Teams iteration)");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Warning($"[Specials/KoH] Team set via iteration failed: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    log.Warning("[Specials/KoH] No neutral team found in Teams collection");
+                }
+
+                // Last resort: null. Often reverts to DefaultTeam but worth trying.
+                try
+                {
+                    teamProp.SetValue(bgo, null);
+                    log.Msg("[Specials/KoH] Team set to null (last-resort)");
+                }
+                catch (Exception ex)
+                {
+                    log.Warning($"[Specials/KoH] All team attempts failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"[Specials/KoH] TryMakeNeutral threw: {ex.Message}");
+            }
+        }
+
+        // True if Si_KingOfTheHill is loaded AND its mode wants full KoH gameplay.
+        // Used to decide whether the layout selection should prefer JSONs that carry
+        // a 'koh' block. Not cached: KoH might load AFTER MapBalance, and its Mode
+        // can change at runtime via /koh mode N.
+        //
+        // We reflect-probe the static property Si_KingOfTheHill.KingOfTheHill.ModeKohActive
+        // (exposed by KGT v0.4+). If absent (older KGT build) we fall back to "loaded =
+        // active" so this stays backwards-compatible.
+        private static bool IsKohModLoaded()
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var t = asm.GetType("Si_KingOfTheHill.KingOfTheHill");
+                if (t == null) continue;
+                try
+                {
+                    var prop = t.GetProperty("ModeKohActive",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                    if (prop != null)
+                    {
+                        var val = prop.GetValue(null);
+                        if (val is bool b) return b;
+                    }
+                }
+                catch { }
+                // Older KGT without the property — treat 'loaded' as 'active'.
+                return true;
+            }
+            return false;
+        }
+
+        // Last-resort prefab lookup: scan all loaded GameObjects for a name match. Used when
+        // GameDatabase doesn't know the prefab (typical for static map props like Fortress_LargeTower_01).
+        private static GameObject? FindPrefabByName(string name, MelonLogger.Instance log)
+        {
+            try
+            {
+                var all = Resources.FindObjectsOfTypeAll<GameObject>();
+                foreach (var go in all)
+                {
+                    if (go != null && go.name == name)
+                    {
+                        log.Msg($"[Specials] FindPrefabByName: matched '{name}' (via Resources.FindObjectsOfTypeAll)");
+                        return go;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Warning($"[Specials] FindPrefabByName threw: {ex.Message}");
+            }
+            return null;
+        }
+    }
+
+    // ============================================================
+    //  Public API consumed by Si_KingOfTheHill, databomb's reactor mod, etc.
+    //  Lives at namespace level so it's referenceable without instantiating MapBalance.
+    // ============================================================
+    public static class MapBalanceSpecials
+    {
+        public class KohEntry
+        {
+            public GameObject? Obj;
+            public float CaptureRadius;
+            public float ExclusionRadius;
+        }
+
+        public class FusionReactorEntry
+        {
+            public GameObject? Obj;
+            public float CaptureRadius;
+        }
+
+        public static KohEntry? Koh;
+        public static readonly List<FusionReactorEntry> FusionReactors = new List<FusionReactorEntry>();
+
+        // Fired after Si_MapBalance has spawned everything on game start.
+        // Subscribers MUST guard their handlers — exceptions don't break the round.
+        public static event Action? OnSpecialsReady;
+
+        internal static void RaiseReady() => OnSpecialsReady?.Invoke();
+
+        public static void Clear()
+        {
+            Koh = null;
+            FusionReactors.Clear();
         }
     }
 }
