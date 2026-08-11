@@ -862,6 +862,21 @@ namespace Si_MapBalance
                     activeIdx++;
                 }
 
+                // RESOURCES TOO, WHILE WE ARE HERE.
+                //
+                // The game calls DistributeAllResources on a normal round start
+                // but NOT on the headless test-harness path, so in test mode the
+                // config's amounts were never applied and every patch stayed
+                // vanilla. SpawnBaseStructures IS called on both paths, and by
+                // this point the config is loaded and the ResourceAreas are
+                // registered, so it is a safe place to make sure.
+                //
+                // Idempotent: on a normal start this runs ~200ms before the
+                // game's own call, which then finds the work already done and
+                // only skips the original. Same result, marginally earlier.
+                try { EnsureResourcesDistributed(FALLBACK_RESOURCE_MULT, "spawn-time fallback"); }
+                catch (Exception rex) { log.Error($"Resource fallback failed: {rex}"); }
+
                 return false; // skip original
             }
             catch (Exception ex)
@@ -1026,6 +1041,58 @@ namespace Si_MapBalance
             }
         }
 
+        private static bool _distributedThisRound;
+
+        /// <summary>
+        /// Multiplier used when WE trigger the distribution instead of the game.
+        /// It only feeds ResourceDistributionAmountMult on each area -- the
+        /// configured biotics_amount / patch_overrides are absolute and are not
+        /// scaled by it -- so this is fidelity with the value the game passes
+        /// (observed 0.8 in every intercepted call), not a tuning knob.
+        /// </summary>
+        private const float FALLBACK_RESOURCE_MULT = 0.8f;
+
+        /// <summary>
+        /// Apply the map config's resource amounts, once per round, whoever asks.
+        ///
+        /// WHY THIS IS NOT JUST THE PREFIX. The game calls DistributeAllResources
+        /// on a normal round start, but NOT on the headless test-harness start
+        /// path. Measured 2026-08-11 on NarakaCity: in test mode the config
+        /// loaded, the game mode matched, SpawnBaseStructures applied the HQ
+        /// positions -- and no "DistributeAllResources intercepted" line ever
+        /// appeared, so every patch stayed at its vanilla 22,000 instead of the
+        /// configured 42,000. Co-op the same minute ran 4,486,000 total against
+        /// test mode's 2,354,000.
+        ///
+        /// That made every soak and every benchmark measure an economy the live
+        /// server does not run.
+        ///
+        /// Returns true when the amounts are on the ground. The flag is only set
+        /// on success, so if the ResourceAreas are not registered yet the game's
+        /// own later call still gets its chance.
+        /// </summary>
+        private static bool EnsureResourcesDistributed(float resourceMultiplier, string why)
+        {
+            var log = Melon<MapBalance>.Logger;
+            if (_distributedThisRound) return true;
+
+            if (_activeConfig == null)
+                _activeConfig = LoadMapConfig();
+            if (_activeConfig == null)
+                return false;                       // no config: vanilla owns this map
+
+            if (GetAllResourceAreas().Count == 0)
+            {
+                log.Msg($"Resource distribution deferred ({why}) — no ResourceAreas registered yet");
+                return false;
+            }
+
+            CustomDistribution(resourceMultiplier);
+            _distributedThisRound = true;
+            log.Msg($"Resource amounts applied ({why})");
+            return true;
+        }
+
         private static bool Prefix_DistributeAllResources(float resourceMultiplier, float disableAmount01)
         {
             var log = Melon<MapBalance>.Logger;
@@ -1043,7 +1110,16 @@ namespace Si_MapBalance
                     return true; // run original game logic
                 }
 
-                CustomDistribution(resourceMultiplier);
+                // Already done at SpawnBaseStructures time? Then this is a
+                // no-op, but the original must still be skipped or vanilla
+                // would overwrite the amounts we just set.
+                if (_distributedThisRound)
+                {
+                    log.Msg("Already distributed this round — skipping original only");
+                    return false;
+                }
+
+                EnsureResourcesDistributed(resourceMultiplier, "game call");
             }
             catch (Exception ex)
             {
@@ -1095,6 +1171,7 @@ namespace Si_MapBalance
             static void Postfix()
             {
                 _dumpedThisRound = false;
+                _distributedThisRound = false;
                 _activeConfig = null;
                 _activeConfigName = "";
                 _swappedSolCent = false;
@@ -1439,6 +1516,51 @@ namespace Si_MapBalance
         private static readonly string SpawnsDir = Path.Combine("UserData", "Spawns");
         private static readonly string LegacyConfigDir = Path.Combine("UserData", "MapBalance", "configs");
 
+        private static bool HasKohBlock(JObject obj)
+        {
+            var koh = obj["koh"];
+            return koh != null && koh.Type == JTokenType.Object;
+        }
+
+        // Pick one layout out of a candidate set, honouring the KGT operating mode.
+        //   Mode 1 (full KoH)   → prefer layouts carrying a 'koh' block.
+        //   Mode 2 (buy only) / Mode 3 (off) / KGT absent
+        //                       → exclude them; a KoH layout without KoH gameplay just
+        //                         drops an uncapturable tower on the map.
+        // If every candidate is a KoH layout we still use one rather than falling back to
+        // vanilla — the spawns/resources in it are still valid. SpawnSpecials independently
+        // suppresses the tower, so no orphan building appears.
+        private static string SelectLayout(
+            List<string> all, List<string> withKoh, List<string> noKoh, MelonLogger.Instance log)
+        {
+            var pool = all;
+
+            if (IsKohModeActive())
+            {
+                if (withKoh.Count > 0)
+                {
+                    log.Msg($"KGT KoH mode active (Mode 1) — preferring {withKoh.Count}/{all.Count} layouts with 'koh' field");
+                    pool = withKoh;
+                }
+            }
+            else if (withKoh.Count > 0)
+            {
+                if (noKoh.Count > 0)
+                {
+                    log.Msg($"KGT KoH mode inactive — excluding {withKoh.Count} KoH layout(s), picking from {noKoh.Count}");
+                    pool = noKoh;
+                }
+                else
+                {
+                    log.Warning($"KGT KoH mode inactive but all {all.Count} candidate layout(s) carry 'koh' — "
+                              + "using one anyway; the KoH tower will not be spawned");
+                }
+            }
+
+            int idx = pool.Count == 1 ? 0 : UnityEngine.Random.Range(0, pool.Count);
+            return pool[idx];
+        }
+
         private static MapConfig? LoadMapConfig(string gameMode = "hvh")
         {
             var log = Melon<MapBalance>.Logger;
@@ -1456,10 +1578,12 @@ namespace Si_MapBalance
             if (Directory.Exists(mapSpawnsDir))
             {
                 var jsonFiles = Directory.GetFiles(mapSpawnsDir, "*.json");
-                // Filter by game_modes if available. Also track which matching layouts have
-                // a "koh" block — Si_KingOfTheHill, if loaded, asks us to prefer those.
+                // Filter by game_modes if available. Also split matching layouts by whether
+                // they carry a "koh" block: KGT Mode 1 prefers those, any other mode excludes
+                // them (see SelectLayout).
                 var matching = new List<string>();
                 var matchingWithKoh = new List<string>();
+                var matchingNoKoh = new List<string>();
                 foreach (var file in jsonFiles)
                 {
                     try
@@ -1470,9 +1594,8 @@ namespace Si_MapBalance
                         if (!modeOk) continue;
 
                         matching.Add(file);
-                        var koh = obj["koh"];
-                        if (koh != null && koh.Type == JTokenType.Object)
-                            matchingWithKoh.Add(file);
+                        if (HasKohBlock(obj)) matchingWithKoh.Add(file);
+                        else matchingNoKoh.Add(file);
                     }
                     catch { }
                 }
@@ -1481,35 +1604,31 @@ namespace Si_MapBalance
 
                 if (matching.Count > 0)
                 {
-                    // Prefer KoH layouts when the KoH mod is loaded and at least one matching layout has 'koh'.
-                    var pool = matching;
-                    if (matchingWithKoh.Count > 0 && IsKohModLoaded())
-                    {
-                        log.Msg($"KoH mod active — preferring {matchingWithKoh.Count}/{matching.Count} layouts with 'koh' field");
-                        pool = matchingWithKoh;
-                    }
-                    int idx = pool.Count == 1 ? 0 : UnityEngine.Random.Range(0, pool.Count);
-                    configPath = pool[idx];
+                    configPath = SelectLayout(matching, matchingWithKoh, matchingNoKoh, log);
                 }
                 else if (jsonFiles.Length > 0)
                 {
                     // No mode-specific match — fall back to mode-agnostic configs only (no game_modes field)
                     var agnostic = new List<string>();
+                    var agnosticWithKoh = new List<string>();
+                    var agnosticNoKoh = new List<string>();
                     foreach (var file in jsonFiles)
                     {
                         try
                         {
                             var obj = JObject.Parse(File.ReadAllText(file));
-                            if (obj["game_modes"] == null)
-                                agnostic.Add(file);
+                            if (obj["game_modes"] != null) continue;
+
+                            agnostic.Add(file);
+                            if (HasKohBlock(obj)) agnosticWithKoh.Add(file);
+                            else agnosticNoKoh.Add(file);
                         }
                         catch { }
                     }
                     if (agnostic.Count > 0)
                     {
                         log.Warning($"No layouts match game mode '{gameMode}' — picking from {agnostic.Count} mode-agnostic layout(s)");
-                        int idx = agnostic.Count == 1 ? 0 : UnityEngine.Random.Range(0, agnostic.Count);
-                        configPath = agnostic[idx];
+                        configPath = SelectLayout(agnostic, agnosticWithKoh, agnosticNoKoh, log);
                     }
                     else
                     {
@@ -2888,8 +3007,14 @@ namespace Si_MapBalance
                 return;
             }
 
-            // KoH (single).
-            if (config.Koh != null)
+            // KoH (single). Only in KGT Mode 1 — Mode 2 is buy-menu-only and Mode 3 is off,
+            // and neither runs the capture/immunity logic that makes the tower meaningful.
+            // Also covers the case where a KoH layout was the only candidate (see SelectLayout).
+            if (config.Koh != null && !IsKohModeActive())
+            {
+                log.Msg("[Specials] KGT KoH mode inactive — skipping KoH tower from layout");
+            }
+            else if (config.Koh != null)
             {
                 // Find a neutral team BEFORE spawning. Passing the team into Game.SpawnPrefab
                 // sets it before the NetworkComponent.SendNetSpawn packet goes out, so clients
@@ -3178,15 +3303,16 @@ namespace Si_MapBalance
             }
         }
 
-        // True if Si_KingOfTheHill is loaded AND its mode wants full KoH gameplay.
-        // Used to decide whether the layout selection should prefer JSONs that carry
-        // a 'koh' block. Not cached: KoH might load AFTER MapBalance, and its Mode
-        // can change at runtime via /koh mode N.
+        // True if Si_KingOfTheHill is loaded AND running Mode 1 (full KoH gameplay).
+        // Mode 2 is buy-menu-only and Mode 3 is disabled — neither counts, so layouts
+        // carrying a 'koh' block are excluded and the tower is not spawned.
+        // Not cached: KGT might load AFTER MapBalance, and its Mode can change at
+        // runtime via /koh mode N.
         //
         // We reflect-probe the static property Si_KingOfTheHill.KingOfTheHill.ModeKohActive
-        // (exposed by KGT v0.4+). If absent (older KGT build) we fall back to "loaded =
-        // active" so this stays backwards-compatible.
-        private static bool IsKohModLoaded()
+        // (== Cfg.Enabled && Cfg.Mode == 1, exposed by KGT v0.4+). If absent (older KGT
+        // build) we fall back to "loaded = active" so this stays backwards-compatible.
+        private static bool IsKohModeActive()
         {
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
