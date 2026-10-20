@@ -2,7 +2,7 @@
  Si_MapBalance - v3.2.0 (Web Tool Integration + !mapdump command)
 
  Per-map configuration:
- - Primary: reads layout JSONs from UserData/Spawns/{MapName}/*.json (web tool output)
+ - Primary: reads layout JSONs from UserData/cfg/Spawns/{MapName}/*.json (web tool output)
  - Fallback: reads from UserData/MapBalance/configs/{MapName}.json (legacy format)
  - Supports per-resource-type amounts, patch_overrides, removed_patches
  - Supports per-faction settings (build radius, chain range)
@@ -27,7 +27,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.2.0", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.0", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -1513,7 +1513,30 @@ namespace Si_MapBalance
 
         // === Config Loading ===
 
-        private static readonly string SpawnsDir = Path.Combine("UserData", "Spawns");
+        // UserData/cfg/Spawns — the server's cfg/ folder. A pre-3.3 UserData/Spawns/ folder
+        // is moved there once (all map subfolders and layouts with it).
+        private static readonly string SpawnsDir = ResolveSpawnsDir();
+
+        private static string ResolveSpawnsDir()
+        {
+            string userData = MelonLoader.Utils.MelonEnvironment.UserDataDirectory;
+            string dir = Path.Combine(userData, "cfg", "Spawns");
+            string legacy = Path.Combine(userData, "Spawns");
+            try
+            {
+                if (!Directory.Exists(dir) && Directory.Exists(legacy))
+                {
+                    Directory.CreateDirectory(Path.Combine(userData, "cfg"));
+                    Directory.Move(legacy, dir);
+                    MelonLogger.Msg($"Moved spawn layouts {legacy} -> {dir}");
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"Could not move {legacy} -> {dir}: {ex.Message}");
+            }
+            return dir;
+        }
         private static readonly string LegacyConfigDir = Path.Combine("UserData", "MapBalance", "configs");
 
         private static bool HasKohBlock(JObject obj)
@@ -1573,7 +1596,7 @@ namespace Si_MapBalance
 
             string? configPath = null;
 
-            // Primary: scan UserData/Spawns/{mapName}/ for *.json files, filtered by game mode
+            // Primary: scan UserData/cfg/Spawns/{mapName}/ for *.json files, filtered by game mode
             string mapSpawnsDir = Path.Combine(SpawnsDir, mapName);
             if (Directory.Exists(mapSpawnsDir))
             {

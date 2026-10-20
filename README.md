@@ -2,7 +2,7 @@
 
 A server-side [Silica](https://store.steampowered.com/app/504900/Silica/) mod that overrides map spawn positions and resource distribution using layout configurations.
 
-> 🛠️ **Author layouts in the browser** with the interactive **[Map Balance Tool](https://drmuck.github.io/Silica-MapBalanceTool/)** — no install required, runs entirely client-side. Pick spawn positions on the map image, place resource patches, tag layouts by game mode, then export ready-to-deploy JSONs straight into `UserData/Spawns/`. Tool source: [github.com/DrMuck/Silica-MapBalanceTool](https://github.com/DrMuck/Silica-MapBalanceTool).
+> 🛠️ **Author layouts in the browser** with the interactive **[Map Balance Tool](https://drmuck.github.io/Silica-MapBalanceTool/)** — no install required, runs entirely client-side. Pick spawn positions on the map image, place resource patches, tag layouts by game mode, then export ready-to-deploy JSONs straight into `UserData/cfg/Spawns/`. Tool source: [github.com/DrMuck/Silica-MapBalanceTool](https://github.com/DrMuck/Silica-MapBalanceTool).
 
 ![Map Balance Tool — Badlands with placed HQs and build-radius rings](docs/screenshots/map_balance_tool_badlands.jpg)
 
@@ -53,7 +53,7 @@ Each JSON contains:
 
 ### 2. Deploy to the server
 
-Copy the JSON files into the server's `UserData/Spawns/` directory, organized by map name:
+Copy the JSON files into the server's `UserData/cfg/Spawns/` directory, organized by map name:
 
 ```
 Silica Dedicated Server/
@@ -75,7 +75,7 @@ The folder name must match the map name exactly (e.g., `Badlands`, `CrimsonPeak`
 
 When a round starts:
 1. The mod detects the **game mode** (HvH / HvA / HvHvA) from active teams
-2. It scans `UserData/Spawns/{MapName}/` for JSON files matching that game mode
+2. It scans `UserData/cfg/Spawns/{MapName}/` for JSON files matching that game mode
 3. One layout is **picked randomly**
 4. In HvH mode, Sol and Cent positions may be **swapped** (50% chance)
 5. HQ spawn positions and resource areas are overridden accordingly
@@ -85,7 +85,7 @@ When a round starts:
 
 1. Requires [MelonLoader](https://github.com/LavaGang/MelonLoader) on the dedicated server
 2. Copy `Si_MapBalance.dll` to the server's `Mods/` folder
-3. Place layout JSONs in `UserData/Spawns/{MapName}/`
+3. Place layout JSONs in `UserData/cfg/Spawns/{MapName}/`
 4. Restart the server
 
 ## JSON Format
