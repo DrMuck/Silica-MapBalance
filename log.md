@@ -1,5 +1,72 @@
 # Si_MapBalance — Change Log
 
+## v3.3.1 — 2026-10-30
+
+### Bug Fix: resources and HQs came from two different layouts
+- **Problem**: On configured maps the Balterium/Biotics totals on the ground matched some
+  OTHER layout of the map than the one announced in allchat and logged as `map_layout`.
+  HvHvA rounds on IndustrialQuarter got the 60k/42k patch amounts that only the hvh-only
+  layouts configure ("larger patches" complaints). Seen in the HL logs 2026-10-23..26.
+  Headless rounds (no game call to DistributeAllResources) were correct.
+- **Root cause**: two independent random picks per round. The game calls
+  `DistributeAllResources` first (MP_Strategy vote end: `SetTeamVersusMode` then
+  `DistributeAllResources`; `SpawnBaseStructures` only later, on the first team join).
+  The prefix called `LoadMapConfig()` with the default mode `"hvh"` and applied that
+  layout's resources. `SpawnBaseStructures` then detected the real mode, called
+  `LoadMapConfig(gameMode)` again, got a different layout, overwrote `_activeConfig`,
+  placed HQs and announced that one. Its resource fallback was a no-op because the
+  round was already marked distributed.
+- **Fix**: exactly one layout pick per round (`PickLayout`), used for both spawns and
+  resources, made by whichever hook runs first:
+  - Game-mode detection moved into `DetectGameMode(...)`, shared by both hooks. The prefix
+    reads the current `MP_Strategy` through `GameMode.CurrentGameMode`. Teams are
+    already active at that point (`GetTeamSetupActive` = Enabled + `TeamsVersus`, which
+    is set right before the call), so the prefix now picks for the REAL mode.
+  - `SpawnBaseStructures` reuses the pick if it was made for the same mode
+    (`_activeConfigMode`). If the modes disagree it logs a Warning, picks again for the
+    mode the HQs are placed for and applies the resources again, so both stay on one layout.
+  - If the mode cannot be known in the prefix (fewer than 2 active teams, not 4way), the
+    prefix does not pick. It skips vanilla and leaves distribution to SpawnBaseStructures,
+    which replays vanilla `DistributeAllResources` if the map/mode has no layout.
+  - `EnsureResourcesDistributed` never loads a config itself any more. A config without
+    spawns now also gets its resources applied at spawn time. If no ResourceAreas exist
+    at spawn time, the pick is kept for a later game call or the OnGameStarted safety net.
+  - A pick left over from another map (OnGameEnded missed) is thrown away, not reused.
+    All per-round pick state is reset in `OnGameEnded`.
+  - Non-strategy modes (Siege, TowerDefense: no SpawnBaseStructures) keep the old hvh-pool
+    pick in the prefix. Maps without a config still run vanilla unchanged. The 50 % Sol/Cent
+    swap is unchanged.
+- **Logging**: one `Layout pick: <file> (mode <m>, by <prefix|spawn>)` line per round,
+  `Layout reuse: ...` from the other hook, and `Layout pick mismatch: ...` as a Warning if
+  the hooks ever disagree.
+
+### Bug Fix: no amounts at all after a map change without a round end
+- **Problem**: live test 2026-10-30 with 3.2.0. GreatErg ended without OnGameEnded and the
+  server loaded IndustrialQuarter, then Badlands. On both, the game call logged "Already
+  distributed this round — skipping original only". The mod applied nothing, and because
+  the original was skipped vanilla did not apply its 0.8x amounts or hide 50 % of patches
+  either. Every patch stayed at the raw scene amount (IndustrialQuarter 30 Balterium at
+  60-96k, 172 Biotics at 22k; Badlands 96 patches, 4,173,600 = full vanilla total). The
+  spawn-time fallback was a no-op for the same reason. Hits every admin map change, map
+  vote and same-map restart not preceded by a proper round end (373 `restarted_same_map`
+  rounds in the archive). This is the bigger cause of the "larger patches" reports.
+- **Root cause**: `_distributedThisRound` / `_activeConfig` were only reset in
+  `OnGameEnded`, so a mark from the previous map survived the level load.
+- **Fix**: a round epoch. `BeginNewRound` bumps it and resets all pick, distribution,
+  swap, specials and spawned-area state. It runs on
+  - every `SceneManager.sceneLoaded` with `LoadSceneMode.Single` (Silica loads Loading
+    and every map that way, see `GameLevelLoader`),
+  - `MusicJukeboxHandler.OnGameRestart` (MP_Strategy.Restart: the start of every round,
+    including an in-place `Restart_Synced` without a scene load),
+  - `OnGameEnded` (as before).
+
+  A layout pick and the "amounts applied" mark carry the epoch and the map name they were
+  made in. `AmountsAppliedThisRound()` (same epoch, same map, config present) is the only
+  gate for "Already distributed", so a game call in a new scene or round always distributes.
+  A pick from another epoch or map is discarded with a Warning.
+
+---
+
 ## v3.1.0 — 2026-03-06
 
 ### Game Mode Filtering

@@ -1,5 +1,5 @@
 /*
- Si_MapBalance - v3.2.0 (Web Tool Integration + !mapdump command)
+ Si_MapBalance - v3.3.1 (Web Tool Integration + !mapdump command)
 
  Per-map configuration:
  - Primary: reads layout JSONs from UserData/cfg/Spawns/{MapName}/*.json (web tool output)
@@ -27,7 +27,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.0", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.1", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -252,6 +252,42 @@ namespace Si_MapBalance
         private static string _activeConfigName = "";
         private static bool _swappedSolCent;
 
+        // ONE LAYOUT PICK PER ROUND (3.3.1). Before, the DistributeAllResources
+        // prefix and the SpawnBaseStructures patch each called LoadMapConfig,
+        // the prefix with the default mode "hvh": resources came from one random
+        // layout, HQs + map_layout announce from another. Now whichever hook
+        // runs first picks (PickLayout) for the detected mode and the other
+        // reuses it. _layoutResolved separates "not picked yet" from "picked,
+        // and this map/mode has no config (vanilla)".
+        private static bool _layoutResolved;
+        private static string _activeConfigMode = "";
+        private static string _activeConfigMap = "";
+        private static string _activeConfigPickedBy = "";
+        // The game's DistributeAllResources call arrived before the mode was
+        // known: original skipped, distribution left to SpawnBaseStructures.
+        private static bool _deferredGameCall;
+        private static float _roundResourceMult = FALLBACK_RESOURCE_MULT;
+        private static float _roundResourceHide;
+        // Set while WE invoke the vanilla DistributeAllResources (deferred call
+        // on a map/mode without a layout): the prefix must let it through.
+        private static bool _passThroughDistribute;
+        private static MethodInfo? _distributeAllMethod;
+        private static Type? _gameModeType;
+        private static PropertyInfo? _currentGameModeProp;
+
+        // ROUND EPOCH (3.3.1, second bug). Bumped at every round boundary:
+        // scene load (LoadSceneMode.Single), MP_Strategy.Restart (OnGameRestart)
+        // and OnGameEnded. A pick or an "amounts applied" mark only counts in
+        // the epoch it was made in. Before, a map change without OnGameEnded
+        // (admin map change, vote, same-map restart) left _distributedThisRound
+        // set from the previous map: the game call on the new map answered
+        // "Already distributed", applied nothing AND skipped vanilla, so every
+        // patch stayed at the raw scene amount (x1.0, nothing hidden).
+        private static int _roundEpoch;
+        private static int _pickEpoch = -1;
+        private static int _distributedEpoch = -1;
+        private static string _distributedMap = "";
+
         /// <summary>
         /// Public: Wildlife spawn position from the active 4way layout config.
         /// Si_4way mod reads this via reflection to place the Wildlife nest.
@@ -296,7 +332,24 @@ namespace Si_MapBalance
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Si_MapBalance v3.2.0 loaded");
+            LoggerInstance.Msg("Si_MapBalance v3.3.1 loaded");
+            // UnityEngine's event rather than MelonMod.OnSceneWasLoaded: we need
+            // the LoadSceneMode. Silica loads Loading + every map with
+            // LoadSceneMode.Single (GameLevelLoader), so Single = new level.
+            SceneManager.sceneLoaded += OnUnitySceneLoaded;
+        }
+
+        private static void OnUnitySceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            try
+            {
+                if (mode != LoadSceneMode.Single) return; // additive: same level, same round
+                BeginNewRound($"scene loaded: {scene.name}");
+            }
+            catch (Exception ex)
+            {
+                Melon<MapBalance>.Logger.Error($"Scene-load reset failed: {ex}");
+            }
         }
 
         public override void OnLateInitializeMelon()
@@ -327,6 +380,7 @@ namespace Si_MapBalance
                 _enableAboveGroundType = asm.GetType("EnableAboveGround");
                 _constructionBoundsType = asm.GetType("ConstructionBounds");
                 _mpStrategyType = asm.GetType("MP_Strategy");
+                _gameModeType = asm.GetType("GameMode");
                 _strategyTeamSetupType = asm.GetType("StrategyTeamSetup");
                 _teamType = asm.GetType("Team");
                 break;
@@ -514,6 +568,8 @@ namespace Si_MapBalance
                 return;
             }
 
+            _distributeAllMethod = distributeMethod;
+
             var prefix = typeof(MapBalance).GetMethod(nameof(Prefix_DistributeAllResources),
                 BindingFlags.Static | BindingFlags.NonPublic);
 
@@ -663,65 +719,28 @@ namespace Si_MapBalance
                 int count = (int)(countProp?.GetValue(teamSetups) ?? 0);
                 var itemProp = teamSetups.GetType().GetProperty("Item");
 
-                // Detect game mode from active teams
-                int activeCount = 0;
-                bool hasAlien = false;
-                for (int i = 0; i < count; i++)
-                {
-                    var s = itemProp?.GetValue(teamSetups, new object[] { i });
-                    if (s != null && getActiveMethod != null &&
-                        (bool)(getActiveMethod.Invoke(__instance, new[] { s }) ?? false))
-                    {
-                        activeCount++;
-                        object? team = GetTeamFromSetup(s);
-                        if (team != null && GetTeamName(team).Contains("Alien"))
-                            hasAlien = true;
-                    }
-                }
-
-                // Check if Si_4way mod is active
-                bool is4way = false;
-                try
-                {
-                    var si4wayType = AppDomain.CurrentDomain.GetAssemblies()
-                        .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
-                        .FirstOrDefault(t => t.FullName == "Si_4way.Si_4way");
-                    if (si4wayType != null)
-                    {
-                        var field = si4wayType.GetField("Is4WayEnabled", BindingFlags.Public | BindingFlags.Static);
-                        if (field != null)
-                            is4way = (bool)(field.GetValue(null) ?? false);
-                    }
-                }
-                catch { }
-
-                string gameMode;
-                if (is4way)
-                    gameMode = "4way";
-                else if (activeCount >= 3)
-                    gameMode = "hvhva";
-                else if (activeCount == 2 && hasAlien)
-                    gameMode = "hva";
-                else
-                    gameMode = "hvh";
+                // Detect game mode from active teams (shared with the DistributeAllResources prefix)
+                string gameMode = DetectGameMode(__instance, out int activeCount, out bool hasAlien, out bool is4way)
+                                  ?? "hvh"; // 0/1 active teams: same default as before
                 log.Msg($"Detected game mode: {gameMode} ({activeCount} active teams, alien={hasAlien}, 4way={is4way})");
 
-                // Load config filtered by game mode
-                var config = LoadMapConfig(gameMode);
+                // Reuse the round's layout if the prefix already picked one for this mode
+                var config = ResolveLayoutAtSpawn(gameMode, log);
                 if (config == null)
                 {
                     log.Msg("SpawnBaseStructures: No config — letting game handle spawn positions");
+                    ReplayDeferredVanillaDistribution(log);
                     return true;
                 }
 
                 if (!config.HasSpawns())
                 {
                     log.Msg("SpawnBaseStructures: No spawn positions in config — letting game handle");
-                    _activeConfig = config; // still use config for resources
+                    // Resources still come from the config (also on the headless
+                    // path, where the game never calls DistributeAllResources).
+                    RunSpawnTimeResourceFallback(log);
                     return true;
                 }
-
-                _activeConfig = config;
 
                 // Extract Wildlife spawn position for Si_4way mod (if present)
                 WildlifeSpawnPos = null;
@@ -871,11 +890,12 @@ namespace Si_MapBalance
                 // this point the config is loaded and the ResourceAreas are
                 // registered, so it is a safe place to make sure.
                 //
-                // Idempotent: on a normal start this runs ~200ms before the
-                // game's own call, which then finds the work already done and
-                // only skips the original. Same result, marginally earlier.
-                try { EnsureResourcesDistributed(FALLBACK_RESOURCE_MULT, "spawn-time fallback"); }
-                catch (Exception rex) { log.Error($"Resource fallback failed: {rex}"); }
+                // Idempotent: on a normal round start the game's call runs
+                // first (MP_Strategy: SetTeamVersusMode + DistributeAllResources
+                // at vote end, SpawnBaseStructures later on the first team
+                // join), so this finds the work already done -- with the SAME
+                // layout, because the prefix picked it and we reused it above.
+                RunSpawnTimeResourceFallback(log);
 
                 return false; // skip original
             }
@@ -1074,48 +1094,332 @@ namespace Si_MapBalance
         private static bool EnsureResourcesDistributed(float resourceMultiplier, string why)
         {
             var log = Melon<MapBalance>.Logger;
-            if (_distributedThisRound) return true;
+            if (AmountsAppliedThisRound()) return true;
 
-            if (_activeConfig == null)
-                _activeConfig = LoadMapConfig();
+            // Never picks a layout itself (that was the 3.3.0 double-pick bug):
+            // only PickLayout does, once per round.
+            if (!_layoutResolved)
+            {
+                log.Msg($"Resource distribution deferred ({why}) — no layout picked yet");
+                return false;
+            }
             if (_activeConfig == null)
                 return false;                       // no config: vanilla owns this map
 
             if (GetAllResourceAreas().Count == 0)
             {
-                log.Msg($"Resource distribution deferred ({why}) — no ResourceAreas registered yet");
+                // _layoutResolved stays set, so a later game call (or the
+                // game-start fallback) applies THIS layout instead of a new pick.
+                log.Msg($"Resource distribution deferred ({why}) — no ResourceAreas registered yet, layout '{_activeConfigName}' kept for a later call");
                 return false;
             }
 
             CustomDistribution(resourceMultiplier);
             _distributedThisRound = true;
-            log.Msg($"Resource amounts applied ({why})");
+            _distributedEpoch = _roundEpoch;
+            _distributedMap = GetCurrentMapName() ?? "";
+            _deferredGameCall = false;
+            _roundResourceMult = resourceMultiplier;
+            log.Msg($"Resource amounts applied ({why}, layout '{_activeConfigName}')");
             return true;
+        }
+
+        // === Layout pick (one per round) ===
+
+        /// <summary>
+        /// Game mode from the active team setups of an MP_Strategy instance
+        /// (+ the Si_4way flag). Returns null when it cannot be told yet (no
+        /// MP_Strategy, or fewer than 2 active teams and not 4way).
+        ///
+        /// GetTeamSetupActive = Enabled and ForTeamVersusModes.Contains(TeamsVersus)
+        /// (GameModeExt; MP_StrategyMatchmaking additionally needs its match
+        /// teams). Both MP_Strategy and MP_StrategyMatchmaking call
+        /// SetTeamVersusMode immediately before DistributeAllResources, so the
+        /// mode IS known in the prefix on every vanilla path (1.0.9 decompile).
+        /// </summary>
+        private static string? DetectGameMode(object? strategy, out int activeCount, out bool hasAlien, out bool is4way)
+        {
+            activeCount = 0;
+            hasAlien = false;
+            is4way = IsSi4WayEnabled();
+
+            if (IsStrategyGameMode(strategy))
+            {
+                var teamSetups = _mpStrategyType!.GetField("TeamSetups", BindingFlags.Public | BindingFlags.Instance)
+                    ?.GetValue(strategy);
+                var getActiveMethod = FindMethod(_mpStrategyType, "GetTeamSetupActive");
+                if (teamSetups != null && getActiveMethod != null)
+                {
+                    int count = (int)(teamSetups.GetType().GetProperty("Count")?.GetValue(teamSetups) ?? 0);
+                    var itemProp = teamSetups.GetType().GetProperty("Item");
+                    for (int i = 0; i < count; i++)
+                    {
+                        var s = itemProp?.GetValue(teamSetups, new object[] { i });
+                        if (s != null && (bool)(getActiveMethod.Invoke(strategy, new[] { s }) ?? false))
+                        {
+                            activeCount++;
+                            object? team = GetTeamFromSetup(s);
+                            if (team != null && GetTeamName(team).Contains("Alien"))
+                                hasAlien = true;
+                        }
+                    }
+                }
+            }
+
+            if (is4way) return "4way";
+            if (activeCount >= 3) return "hvhva";
+            if (activeCount == 2) return hasAlien ? "hva" : "hvh";
+            return null;
+        }
+
+        private static bool IsSi4WayEnabled()
+        {
+            try
+            {
+                var si4wayType = AppDomain.CurrentDomain.GetAssemblies()
+                    .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
+                    .FirstOrDefault(t => t.FullName == "Si_4way.Si_4way");
+                var field = si4wayType?.GetField("Is4WayEnabled", BindingFlags.Public | BindingFlags.Static);
+                if (field != null)
+                    return (bool)(field.GetValue(null) ?? false);
+            }
+            catch { }
+            return false;
+        }
+
+        private static object? GetCurrentGameModeInstance()
+        {
+            try
+            {
+                if (_currentGameModeProp == null && _gameModeType != null)
+                    _currentGameModeProp = _gameModeType.GetProperty("CurrentGameMode",
+                        BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy);
+                return _currentGameModeProp?.GetValue(null);
+            }
+            catch { return null; }
+        }
+
+        private static bool IsStrategyGameMode(object? gameMode) =>
+            gameMode != null && _mpStrategyType != null && _mpStrategyType.IsInstanceOfType(gameMode);
+
+        /// <summary>The ONLY place a layout is chosen. Sets the round's pick.</summary>
+        private static MapConfig? PickLayout(string gameMode, string by, MelonLogger.Instance log)
+        {
+            _activeConfigName = "";
+            _activeConfig = LoadMapConfig(gameMode);
+            if (_activeConfig == null) _activeConfigName = "";
+            _activeConfigMode = gameMode;
+            _activeConfigMap = GetCurrentMapName() ?? "";
+            _activeConfigPickedBy = by;
+            _pickEpoch = _roundEpoch;
+            _layoutResolved = true;
+
+            if (_activeConfig != null)
+                log.Msg($"Layout pick: {_activeConfigName} (mode {gameMode}, by {by})");
+            else
+                log.Msg($"Layout pick: none, vanilla (mode {gameMode}, by {by})");
+            return _activeConfig;
+        }
+
+        /// <summary>
+        /// True if this round already has a pick. A pick left over from another
+        /// map (OnGameEnded never fired) is discarded rather than reused.
+        /// </summary>
+        private static bool HasLayoutPickForThisRound(MelonLogger.Instance log)
+        {
+            if (!_layoutResolved) return false;
+            string map = GetCurrentMapName() ?? "";
+            if (map == _activeConfigMap && _pickEpoch == _roundEpoch) return true;
+
+            log.Warning($"Discarding stale layout pick '{PickDisplayName()}' from map '{_activeConfigMap}' " +
+                        $"(now '{map}', pick epoch {_pickEpoch}, round epoch {_roundEpoch})");
+            ResetRoundLayoutState();
+            return false;
+        }
+
+        /// <summary>
+        /// True only if THIS round (epoch) on THIS map really put a layout's
+        /// amounts on the ground. The only gate for "already distributed".
+        /// </summary>
+        private static bool AmountsAppliedThisRound() =>
+            _distributedThisRound
+            && _activeConfig != null
+            && _distributedEpoch == _roundEpoch
+            && _distributedMap == (GetCurrentMapName() ?? "");
+
+        /// <summary>
+        /// Round boundary: scene load, MP_Strategy.Restart, game end. Drops the
+        /// pick and every distribution mark of the previous round.
+        /// </summary>
+        private static void BeginNewRound(string reason)
+        {
+            var log = Melon<MapBalance>.Logger;
+            if (_layoutResolved || _distributedThisRound)
+                log.Msg($"New round ({reason}) — dropping layout pick '{PickDisplayName()}' " +
+                        $"(mode {_activeConfigMode}, map {_activeConfigMap}, amounts applied={_distributedThisRound})");
+            else
+                log.Msg($"New round ({reason})");
+            _roundEpoch++;
+            ResetRoundLayoutState();
+            _dumpedThisRound = false;
+            _swappedSolCent = false;
+            WildlifeSpawnPos = null;
+            CleanupSpawnedAreas();          // Unity-null-safe: objects of an unloaded scene are skipped
+            MapBalanceSpecials.Clear();
+        }
+
+        private static string PickDisplayName() => _activeConfig != null ? _activeConfigName : "none (vanilla)";
+
+        /// <summary>
+        /// SpawnBaseStructures: reuse the prefix pick when it was made for the
+        /// same mode. If the modes disagree, re-pick for the mode the HQs are
+        /// actually placed for and re-apply resources so both stay on one layout.
+        /// </summary>
+        private static MapConfig? ResolveLayoutAtSpawn(string gameMode, MelonLogger.Instance log)
+        {
+            if (!HasLayoutPickForThisRound(log))
+                return PickLayout(gameMode, "spawn", log);
+
+            if (_activeConfigMode == gameMode)
+            {
+                log.Msg($"Layout reuse: {PickDisplayName()} (mode {gameMode}, picked by {_activeConfigPickedBy})");
+                return _activeConfig;
+            }
+
+            bool wasDistributed = AmountsAppliedThisRound();
+            log.Warning($"Layout pick mismatch: {_activeConfigPickedBy} picked '{PickDisplayName()}' for mode {_activeConfigMode}, " +
+                        $"SpawnBaseStructures detected mode {gameMode} — re-picking for {gameMode}" +
+                        (wasDistributed ? " and re-applying resources" : ""));
+            _distributedThisRound = false;
+            var config = PickLayout(gameMode, "spawn", log);
+
+            // The old layout amounts are on the ground but the real mode has no
+            // layout: let vanilla redo the distribution. (With a new layout,
+            // the spawn-time fallback re-applies; CustomDistribution zeroes
+            // every area first, so a second run is safe.)
+            if (wasDistributed && config == null)
+                InvokeVanillaDistribution(_roundResourceMult, _roundResourceHide,
+                    "mode mismatch, real mode has no layout", log);
+            return config;
+        }
+
+        private static void RunSpawnTimeResourceFallback(MelonLogger.Instance log)
+        {
+            try
+            {
+                EnsureResourcesDistributed(_roundResourceMult,
+                    _deferredGameCall ? "deferred game call" : "spawn-time fallback");
+            }
+            catch (Exception rex) { log.Error($"Resource fallback failed: {rex}"); }
+        }
+
+        /// <summary>
+        /// The prefix deferred the game call (mode unknown) and skipped the
+        /// original, but the round turned out to have no layout: run the
+        /// vanilla distribution now so the map is not left un-distributed.
+        /// </summary>
+        private static void ReplayDeferredVanillaDistribution(MelonLogger.Instance log)
+        {
+            if (_deferredGameCall)
+                InvokeVanillaDistribution(_roundResourceMult, _roundResourceHide,
+                    "deferred game call, no layout for this map/mode", log);
+        }
+
+        private static void InvokeVanillaDistribution(float mult, float hide, string why, MelonLogger.Instance log)
+        {
+            _deferredGameCall = false;
+            if (_distributeAllMethod == null)
+            {
+                log.Warning($"Cannot run vanilla DistributeAllResources ({why}) — method not cached");
+                return;
+            }
+            log.Msg($"Running vanilla DistributeAllResources ({why})");
+            _passThroughDistribute = true;
+            try { _distributeAllMethod.Invoke(null, new object[] { mult, hide }); }
+            catch (Exception ex) { log.Error($"Vanilla DistributeAllResources failed: {ex}"); }
+            finally { _passThroughDistribute = false; }
+        }
+
+        private static void ResetRoundLayoutState()
+        {
+            _layoutResolved = false;
+            _activeConfig = null;
+            _activeConfigName = "";
+            _activeConfigMode = "";
+            _activeConfigMap = "";
+            _activeConfigPickedBy = "";
+            _distributedThisRound = false;
+            _pickEpoch = -1;
+            _distributedEpoch = -1;
+            _distributedMap = "";
+            _deferredGameCall = false;
+            _roundResourceMult = FALLBACK_RESOURCE_MULT;
+            _roundResourceHide = 0f;
         }
 
         private static bool Prefix_DistributeAllResources(float resourceMultiplier, float disableAmount01)
         {
+            if (_passThroughDistribute) return true; // our own replay of the vanilla logic
+
             var log = Melon<MapBalance>.Logger;
             log.Msg($"=== DistributeAllResources intercepted (mult={resourceMultiplier}, hide={disableAmount01}) ===");
 
             try
             {
-                // Load config early — if no config exists for this map, let vanilla handle it
-                if (_activeConfig == null)
-                    _activeConfig = LoadMapConfig();
+                _roundResourceMult = resourceMultiplier;
+                _roundResourceHide = disableAmount01;
+                var gm = GetCurrentGameModeInstance();
 
-                if (_activeConfig == null)
+                MapConfig? config;
+                if (HasLayoutPickForThisRound(log))
+                {
+                    // Spawn (or an earlier call) already picked: never pick again.
+                    config = _activeConfig;
+                    string? mode = IsStrategyGameMode(gm) ? DetectGameMode(gm, out _, out _, out _) : null;
+                    if (mode != null && mode != _activeConfigMode)
+                        log.Warning($"Layout pick mismatch: {_activeConfigPickedBy} picked '{PickDisplayName()}' for mode {_activeConfigMode}, " +
+                                    $"DistributeAllResources sees mode {mode} — keeping the existing pick so HQs and resources stay on one layout");
+                    else
+                        log.Msg($"Layout reuse: {PickDisplayName()} (mode {_activeConfigMode}, picked by {_activeConfigPickedBy})");
+                }
+                else if (!IsStrategyGameMode(gm))
+                {
+                    // Not MP_Strategy (Siege, TowerDefense, ...): SpawnBaseStructures
+                    // never runs there, so this is the only hook. Same pool as before.
+                    log.Msg("Non-strategy game mode — picking from the hvh pool here");
+                    config = PickLayout("hvh", "prefix", log);
+                }
+                else
+                {
+                    string? mode = DetectGameMode(gm, out int activeCount, out bool hasAlien, out bool is4way);
+                    if (mode == null)
+                    {
+                        // Mode not known yet: do NOT pick (that was the bug). Skip
+                        // vanilla too (it would set amounts); SpawnBaseStructures
+                        // picks for the real mode and distributes, or replays
+                        // vanilla if the map/mode has no layout.
+                        _deferredGameCall = true;
+                        log.Msg($"Game mode not known yet ({activeCount} active teams) — no layout pick, original skipped, distribution deferred to SpawnBaseStructures");
+                        return false;
+                    }
+                    log.Msg($"Detected game mode: {mode} ({activeCount} active teams, alien={hasAlien}, 4way={is4way})");
+                    config = PickLayout(mode, "prefix", log);
+                }
+
+                if (config == null)
                 {
                     log.Msg("No map config — letting game handle resource distribution (vanilla)");
                     return true; // run original game logic
                 }
 
-                // Already done at SpawnBaseStructures time? Then this is a
-                // no-op, but the original must still be skipped or vanilla
-                // would overwrite the amounts we just set.
-                if (_distributedThisRound)
+                // Already done at SpawnBaseStructures time IN THIS ROUND
+                // (epoch + map)? Then this is a no-op, but the original must
+                // still be skipped or vanilla would overwrite our amounts. A
+                // mark from an earlier scene/round never gets here: the epoch
+                // differs, so the game call distributes for the new round.
+                if (AmountsAppliedThisRound())
                 {
-                    log.Msg("Already distributed this round — skipping original only");
+                    log.Msg($"Already distributed this round (layout '{_activeConfigName}') — skipping original only");
                     return false;
                 }
 
@@ -1138,6 +1442,13 @@ namespace Si_MapBalance
                 try
                 {
                     _dumpedThisRound = false;
+
+                    // Last chance for a pick whose distribution was deferred
+                    // (no ResourceAreas at spawn time and no later game call).
+                    // No-op when already distributed or no layout was picked.
+                    if (_layoutResolved && _activeConfig != null && _pickEpoch == _roundEpoch
+                        && !AmountsAppliedThisRound())
+                        RunSpawnTimeResourceFallback(Melon<MapBalance>.Logger);
 
                     // Announce selected config in allchat + game log
                     if (_activeConfig != null)
@@ -1170,13 +1481,23 @@ namespace Si_MapBalance
         {
             static void Postfix()
             {
-                _dumpedThisRound = false;
-                _distributedThisRound = false;
-                _activeConfig = null;
-                _activeConfigName = "";
-                _swappedSolCent = false;
-                CleanupSpawnedAreas();
-                MapBalanceSpecials.Clear();
+                try { BeginNewRound("game ended"); }
+                catch (Exception ex) { Melon<MapBalance>.Logger.Error($"OnGameEnded reset failed: {ex}"); }
+            }
+        }
+
+        // MP_Strategy.Restart() fires GameEvents.OnGameRestart at the start of
+        // every round (StartGameLoop after a level load, and Restart_Synced for
+        // an in-place restart WITHOUT a scene load), always before the vote
+        // end that calls DistributeAllResources. MusicJukeboxHandler subscribes
+        // twice, so this runs twice per restart; BeginNewRound is idempotent.
+        [HarmonyPatch(typeof(MusicJukeboxHandler), "OnGameRestart")]
+        private static class Patch_OnGameRestart
+        {
+            static void Postfix()
+            {
+                try { BeginNewRound("game restart"); }
+                catch (Exception ex) { Melon<MapBalance>.Logger.Error($"OnGameRestart reset failed: {ex}"); }
             }
         }
 
