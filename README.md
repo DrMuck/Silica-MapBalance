@@ -16,7 +16,7 @@ Maps without a configuration run fully vanilla — no changes to spawns or resou
 - **Resource control**: per-type amounts (Balterium, Biotics), per-patch overrides, patch removal
 - **Game mode filtering**: layouts are tagged as HvH, HvA, or HvHvA — the mod auto-detects the active game mode and only picks from matching configs
 - **Multiple layouts per map**: place several JSON files in a map folder and the mod picks one randomly each round
-- **Sol/Cent swap**: in HvH mode, spawn positions are randomly swapped (50% chance) for extra variation
+- **Sol/Cent swap**: in HvH and HvHvA, spawn positions are randomly swapped (50% chance) for extra variation; a layout can turn it off with `"swap_spawns": false`
 - **Allchat announcement**: the selected layout name is shown to all players at game start
 - **Per-faction settings**: build radius and chain range per faction
 
@@ -77,7 +77,7 @@ When a round starts:
 1. The mod detects the **game mode** (HvH / HvA / HvHvA) from active teams
 2. It scans `UserData/cfg/Spawns/{MapName}/` for JSON files matching that game mode
 3. One layout is **picked randomly**
-4. In HvH mode, Sol and Cent positions may be **swapped** (50% chance)
+4. In HvH and HvHvA, Sol and Cent positions may be **swapped** (50% chance), unless the layout sets `"swap_spawns": false`
 5. HQ spawn positions and resource areas are overridden accordingly
 6. The selected layout name is **announced in allchat**
 
@@ -116,7 +116,8 @@ Layout files exported from the Map Balance Tool look like this:
     "hvh": true,
     "hva": false,
     "hvhva": false
-  }
+  },
+  "swap_spawns": true
 }
 ```
 
@@ -130,6 +131,7 @@ Layout files exported from the Map Balance Tool look like this:
 | `settings.*BuildRadius` | Build radius per faction |
 | `settings.*ChainRange` | Chain range per faction |
 | `game_modes` | Which game modes this layout is valid for |
+| `swap_spawns` | `false` = never swap Sol and Cent positions for this layout; absent or `true` = 50 % swap in HvH / HvHvA |
 
 ## Build
 

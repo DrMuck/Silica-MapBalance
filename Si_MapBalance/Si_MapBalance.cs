@@ -27,7 +27,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.1", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.2", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -58,6 +58,11 @@ namespace Si_MapBalance
 
         [JsonProperty("game_modes")]
         public JToken? GameModes;
+
+        // Random 50 % Sol <-> Cent position swap in HvH / HvHvA. Absent = true (the old
+        // behaviour); false keeps Sol and Cent on their own positions (asymmetric layouts).
+        [JsonProperty("swap_spawns")]
+        public bool SwapSpawns = true;
 
         // Single King of the Hill tower spawn (null = not configured for this map).
         // Consumed by Si_KingOfTheHill mod via MapBalanceSpecials.
@@ -758,9 +763,12 @@ namespace Si_MapBalance
                     }
                 }
 
-                // For HvH/HvHvA: randomly swap Sol↔Cent positions for extra variation
+                // For HvH/HvHvA: randomly swap Sol↔Cent positions for extra variation,
+                // unless the layout says "swap_spawns": false
                 _swappedSolCent = false;
-                if ((gameMode == "hvh" || gameMode == "hvhva") && UnityEngine.Random.Range(0, 2) == 1)
+                if ((gameMode == "hvh" || gameMode == "hvhva") && !config.SwapSpawns)
+                    log.Msg($"{gameMode}: Sol ↔ Cent swap disabled by the layout (swap_spawns: false)");
+                else if ((gameMode == "hvh" || gameMode == "hvhva") && UnityEngine.Random.Range(0, 2) == 1)
                 {
                     // Terrain safety check: verify both swap-target positions are not near cliffs
                     var solSpawn = config.GetFactionSpawn("Sol", log);

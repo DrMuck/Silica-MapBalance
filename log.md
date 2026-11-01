@@ -1,5 +1,15 @@
 # Si_MapBalance — Change Log
 
+## v3.3.2 — 2026-11-01
+
+### Feature: per-layout switch for the Sol ↔ Cent swap
+- New top-level layout field `"swap_spawns"`: `false` keeps Sol and Cent on their own
+  positions for that layout (asymmetric hand-made layouts); absent or `true` = the old
+  50 % swap in HvH / HvHvA, so existing layouts behave as before.
+- Log line `<mode>: Sol ↔ Cent swap disabled by the layout (swap_spawns: false)`; no
+  "(swapped)" suffix in the announcement then.
+- The MapBalance web tool writes the field (checkbox "Random Sol/Cent swap" under Game Modes).
+
 ## v3.3.1 — 2026-10-30
 
 ### Bug Fix: resources and HQs came from two different layouts
