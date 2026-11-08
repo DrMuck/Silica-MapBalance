@@ -1,5 +1,5 @@
 /*
- Si_MapBalance - v3.3.1 (Web Tool Integration + !mapdump command)
+ Si_MapBalance - v3.4.0 (Web Tool Integration + !mapdump command + 2v1 layouts)
 
  Per-map configuration:
  - Primary: reads layout JSONs from UserData/cfg/Spawns/{MapName}/*.json (web tool output)
@@ -27,7 +27,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.3.2", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.4.0", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -268,6 +268,13 @@ namespace Si_MapBalance
         private static string _activeConfigMode = "";
         private static string _activeConfigMap = "";
         private static string _activeConfigPickedBy = "";
+        // 2v1 (3.4.0): the pick was made for a Si_VersusVote 2v1 round (hvhva teams,
+        // Sol + Cent allied). Part of the reuse key next to the mode.
+        private static bool _activeConfigTwoVsOne;
+        // The 2v1 round fell back to normal 3-way layouts (none flagged 2v1 on the map).
+        private static bool _activeConfigTwoVsOneFallback;
+        // Maps already warned about "2v1 round but no 2v1 layout" (warn once per map).
+        private static readonly HashSet<string> _warnedNoTwoVsOne = new HashSet<string>();
         // The game's DistributeAllResources call arrived before the mode was
         // known: original skipped, distribution left to SpawnBaseStructures.
         private static bool _deferredGameCall;
@@ -337,7 +344,7 @@ namespace Si_MapBalance
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Si_MapBalance v3.3.1 loaded");
+            LoggerInstance.Msg("Si_MapBalance v3.4.0 loaded");
             // UnityEngine's event rather than MelonMod.OnSceneWasLoaded: we need
             // the LoadSceneMode. Silica loads Loading + every map with
             // LoadSceneMode.Single (GameLevelLoader), so Single = new level.
@@ -1213,21 +1220,53 @@ namespace Si_MapBalance
         /// <summary>The ONLY place a layout is chosen. Sets the round's pick.</summary>
         private static MapConfig? PickLayout(string gameMode, string by, MelonLogger.Instance log)
         {
+            bool twoVsOne = IsTwoVsOneRound(gameMode, log);
             _activeConfigName = "";
-            _activeConfig = LoadMapConfig(gameMode);
+            // true until LoadMapConfig really picks from the 2v1 pool
+            _activeConfigTwoVsOneFallback = twoVsOne;
+            _activeConfig = LoadMapConfig(gameMode, twoVsOne);
             if (_activeConfig == null) _activeConfigName = "";
             _activeConfigMode = gameMode;
+            _activeConfigTwoVsOne = twoVsOne;
             _activeConfigMap = GetCurrentMapName() ?? "";
             _activeConfigPickedBy = by;
             _pickEpoch = _roundEpoch;
             _layoutResolved = true;
 
+            string tag = ModeTag(gameMode, twoVsOne);
             if (_activeConfig != null)
-                log.Msg($"Layout pick: {_activeConfigName} (mode {gameMode}, by {by})");
+                log.Msg($"Layout pick: {_activeConfigName} (mode {tag}, by {by})");
             else
-                log.Msg($"Layout pick: none, vanilla (mode {gameMode}, by {by})");
+                log.Msg($"Layout pick: none, vanilla (mode {tag}, by {by})");
             return _activeConfig;
         }
+
+        /// <summary>
+        /// 2v1 round = Si_VersusVote says so (VersusApi.TwoVsOneActive) AND the teams
+        /// are a 3-team (hvhva) setup. VersusVote sets the flag in its Priority.First
+        /// SetTeamVersusMode prefix; both of our pick points run after that call
+        /// returned, so the flag is final here.
+        /// </summary>
+        private static bool IsTwoVsOneRound(string gameMode, MelonLogger.Instance log)
+        {
+            if (!VersusVoteBridge.TwoVsOneActive) return false;
+            if (gameMode != "hvhva")
+            {
+                log.Warning($"Si_VersusVote reports a 2v1 round but the active teams are '{gameMode}', not 3-team — ignoring the 2v1 flag");
+                return false;
+            }
+            return true;
+        }
+
+        private static string ModeTag(string gameMode, bool twoVsOne) => twoVsOne ? $"{gameMode}/2v1" : gameMode;
+
+        /// <summary>
+        /// Layout flagged for 2v1 rounds: "game_modes": { ..., "2v1": true }.
+        /// Missing key (or false) = normal layout.
+        /// </summary>
+        private static bool IsTwoVsOneLayout(JObject obj) =>
+            obj["game_modes"] is JObject gm
+            && gm["2v1"] is JToken v && v.Type == JTokenType.Boolean && v.Value<bool>();
 
         /// <summary>
         /// True if this round already has a pick. A pick left over from another
@@ -1269,6 +1308,7 @@ namespace Si_MapBalance
                 log.Msg($"New round ({reason})");
             _roundEpoch++;
             ResetRoundLayoutState();
+            VersusVoteBridge.ResetForNewRound();
             _dumpedThisRound = false;
             _swappedSolCent = false;
             WildlifeSpawnPos = null;
@@ -1288,15 +1328,21 @@ namespace Si_MapBalance
             if (!HasLayoutPickForThisRound(log))
                 return PickLayout(gameMode, "spawn", log);
 
-            if (_activeConfigMode == gameMode)
+            // The 2v1 state is part of the key: if Si_VersusVote changed its decision
+            // after the prefix pick, HQs are not placed yet (this IS the
+            // SpawnBaseStructures prefix), so the round can still move to the right layout.
+            bool twoVsOneNow = IsTwoVsOneRound(gameMode, log);
+            string tagNow = ModeTag(gameMode, twoVsOneNow);
+            string tagPicked = ModeTag(_activeConfigMode, _activeConfigTwoVsOne);
+            if (_activeConfigMode == gameMode && _activeConfigTwoVsOne == twoVsOneNow)
             {
-                log.Msg($"Layout reuse: {PickDisplayName()} (mode {gameMode}, picked by {_activeConfigPickedBy})");
+                log.Msg($"Layout reuse: {PickDisplayName()} (mode {tagNow}, picked by {_activeConfigPickedBy})");
                 return _activeConfig;
             }
 
             bool wasDistributed = AmountsAppliedThisRound();
-            log.Warning($"Layout pick mismatch: {_activeConfigPickedBy} picked '{PickDisplayName()}' for mode {_activeConfigMode}, " +
-                        $"SpawnBaseStructures detected mode {gameMode} — re-picking for {gameMode}" +
+            log.Warning($"Layout pick mismatch: {_activeConfigPickedBy} picked '{PickDisplayName()}' for mode {tagPicked}, " +
+                        $"SpawnBaseStructures detected mode {tagNow} — re-picking for {tagNow}" +
                         (wasDistributed ? " and re-applying resources" : ""));
             _distributedThisRound = false;
             var config = PickLayout(gameMode, "spawn", log);
@@ -1356,6 +1402,8 @@ namespace Si_MapBalance
             _activeConfigMode = "";
             _activeConfigMap = "";
             _activeConfigPickedBy = "";
+            _activeConfigTwoVsOne = false;
+            _activeConfigTwoVsOneFallback = false;
             _distributedThisRound = false;
             _pickEpoch = -1;
             _distributedEpoch = -1;
@@ -1388,7 +1436,7 @@ namespace Si_MapBalance
                         log.Warning($"Layout pick mismatch: {_activeConfigPickedBy} picked '{PickDisplayName()}' for mode {_activeConfigMode}, " +
                                     $"DistributeAllResources sees mode {mode} — keeping the existing pick so HQs and resources stay on one layout");
                     else
-                        log.Msg($"Layout reuse: {PickDisplayName()} (mode {_activeConfigMode}, picked by {_activeConfigPickedBy})");
+                        log.Msg($"Layout reuse: {PickDisplayName()} (mode {ModeTag(_activeConfigMode, _activeConfigTwoVsOne)}, picked by {_activeConfigPickedBy})");
                 }
                 else if (!IsStrategyGameMode(gm))
                 {
@@ -1462,7 +1510,10 @@ namespace Si_MapBalance
                     if (_activeConfig != null)
                     {
                         string swap = _swappedSolCent ? " (swapped)" : "";
-                        string msg = $"Map Balance: {_activeConfigName}{swap}";
+                        string versus = !_activeConfigTwoVsOne ? ""
+                            : _activeConfigTwoVsOneFallback ? " [2v1 round, no 2v1 layout: 3-way layout]"
+                            : " [2v1: Sol + Centauri vs Aliens]";
+                        string msg = $"Map Balance: {_activeConfigName}{swap}{versus}";
                         _sendServerChatMethod?.Invoke(null, new object[] { msg });
                         Melon<MapBalance>.Logger.Msg($"Allchat: {msg}");
                         // Write to game log so MapReplay can pick it up
@@ -1913,7 +1964,38 @@ namespace Si_MapBalance
             return pool[idx];
         }
 
-        private static MapConfig? LoadMapConfig(string gameMode = "hvh")
+        /// <summary>
+        /// 2v1 pool: layouts with "game_modes": {"2v1": true}. The hvhva flag of such
+        /// a layout does not matter (2v1 layouts are 3-team layouts by definition).
+        /// KoH preference/exclusion as in every other pool. Null = none on this map.
+        /// </summary>
+        private static string? SelectTwoVsOneLayout(string[] jsonFiles, string mapName, MelonLogger.Instance log)
+        {
+            var all = new List<string>();
+            var withKoh = new List<string>();
+            var noKoh = new List<string>();
+            foreach (var file in jsonFiles)
+            {
+                try
+                {
+                    var obj = JObject.Parse(File.ReadAllText(file));
+                    if (!IsTwoVsOneLayout(obj)) continue;
+                    all.Add(file);
+                    if (HasKohBlock(obj)) withKoh.Add(file);
+                    else noKoh.Add(file);
+                }
+                catch { }
+            }
+            if (all.Count == 0) return null;
+
+            string picked = SelectLayout(all, withKoh, noKoh, log);
+            log.Msg($"2v1 round on {mapName}: {all.Count} candidate layout(s) [" +
+                    string.Join(", ", all.Select(Path.GetFileNameWithoutExtension)) +
+                    $"] — picked {Path.GetFileNameWithoutExtension(picked)}");
+            return picked;
+        }
+
+        private static MapConfig? LoadMapConfig(string gameMode = "hvh", bool twoVsOne = false)
         {
             var log = Melon<MapBalance>.Logger;
             string? mapName = GetCurrentMapName();
@@ -1930,13 +2012,31 @@ namespace Si_MapBalance
             if (Directory.Exists(mapSpawnsDir))
             {
                 var jsonFiles = Directory.GetFiles(mapSpawnsDir, "*.json");
+
+                // 2v1 round (3.4.0): only layouts flagged "game_modes": {"2v1": true}.
+                // None on this map -> warn once, then the normal 3-way pool below.
+                if (twoVsOne)
+                {
+                    configPath = SelectTwoVsOneLayout(jsonFiles, mapName!, log);
+                    if (configPath != null)
+                        _activeConfigTwoVsOneFallback = false;
+                    else
+                    {
+                        if (_warnedNoTwoVsOne.Add(mapName!))
+                            log.Warning($"2v1 round on {mapName}: no layout flagged \"2v1\" in {mapSpawnsDir} — falling back to the normal 3-way layouts");
+                        else
+                            log.Msg($"2v1 round on {mapName}: no 2v1 layout — normal 3-way pool");
+                    }
+                }
+
                 // Filter by game_modes if available. Also split matching layouts by whether
                 // they carry a "koh" block: KGT Mode 1 prefers those, any other mode excludes
                 // them (see SelectLayout).
                 var matching = new List<string>();
                 var matchingWithKoh = new List<string>();
                 var matchingNoKoh = new List<string>();
-                foreach (var file in jsonFiles)
+                int excludedTwoVsOne = 0;
+                foreach (var file in configPath != null ? Array.Empty<string>() : jsonFiles)
                 {
                     try
                     {
@@ -1944,6 +2044,9 @@ namespace Si_MapBalance
                         var modes = obj["game_modes"];
                         bool modeOk = modes == null || modes[gameMode]?.Value<bool>() == true;
                         if (!modeOk) continue;
+                        // A 2v1 layout (Sol + Cent placed as a bloc) never runs in a
+                        // normal 3-way round, even if it also carries "hvhva": true.
+                        if (gameMode == "hvhva" && IsTwoVsOneLayout(obj)) { excludedTwoVsOne++; continue; }
 
                         matching.Add(file);
                         if (HasKohBlock(obj)) matchingWithKoh.Add(file);
@@ -1952,9 +2055,15 @@ namespace Si_MapBalance
                     catch { }
                 }
 
-                log.Msg($"Found {jsonFiles.Length} layouts for {mapName}, {matching.Count} match game mode '{gameMode}' ({matchingWithKoh.Count} with KoH)");
+                if (configPath == null)
+                    log.Msg($"Found {jsonFiles.Length} layouts for {mapName}, {matching.Count} match game mode '{gameMode}' ({matchingWithKoh.Count} with KoH)"
+                            + (excludedTwoVsOne > 0 ? $", {excludedTwoVsOne} 2v1 layout(s) excluded (not a 2v1 round)" : ""));
 
-                if (matching.Count > 0)
+                if (configPath != null)
+                {
+                    // 2v1 pick made above
+                }
+                else if (matching.Count > 0)
                 {
                     configPath = SelectLayout(matching, matchingWithKoh, matchingNoKoh, log);
                 }

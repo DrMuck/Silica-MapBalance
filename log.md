@@ -1,5 +1,27 @@
 # Si_MapBalance — Change Log
 
+## v3.4.0 — 2026-11-08
+
+### Feature: 2v1 layouts for Si_VersusVote rounds
+- Si_VersusVote turns a voted HvHvA on some maps (IndustrialQuarter) into a 2v1: Sol and
+  Centauri allied for the whole round against the Aliens. New layout flag
+  `"game_modes": { ..., "2v1": true }` (an extra key in the existing mode map, like `4way`).
+- 2v1 round (`VersusApi.TwoVsOneActive` and 3 active teams): only `"2v1"` layouts are
+  candidates; none on the map -> Warning once per map, normal HvHvA pool. Normal HvHvA
+  round: `"2v1"` layouts are excluded even if they also say `"hvhva": true`.
+  HvH / HvA / 4way unchanged. Missing key = normal layout.
+- `VersusVoteBridge` reads `Si_VersusVote.VersusApi` by reflection (ApiVersion >= 1);
+  lookup retried once per round while missing. Without Si_VersusVote: as 3.3.2.
+- Timing: the pick happens in the DistributeAllResources prefix (vanilla calls it right after
+  SetTeamVersusMode returns, MP_Strategy 1.0.15 ~2590) or the SpawnBaseStructures prefix
+  (first team join, headless path) — both after VersusVote's Priority.First
+  SetTeamVersusMode prefix set the flag. The 2v1 state is part of the per-round reuse key:
+  if it differs at SpawnBaseStructures (HQs not yet placed), re-pick + re-apply resources.
+- Logs: `2v1 round on <Map>: N candidate layout(s) [...] — picked X`, mode shown as
+  `hvhva/2v1` in `Layout pick/reuse`, `N 2v1 layout(s) excluded (not a 2v1 round)`.
+  Allchat: `Map Balance: X [2v1: Sol + Centauri vs Aliens]`. `map_layout` log line unchanged.
+- Tool: checkbox "2v1 (allied humans vs Aliens)" under Game Modes (Si_MapBalanceTool b44c1a7).
+
 ## v3.3.2 — 2026-11-01
 
 ### Feature: per-layout switch for the Sol ↔ Cent swap
