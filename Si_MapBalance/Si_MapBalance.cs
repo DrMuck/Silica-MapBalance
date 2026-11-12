@@ -1,5 +1,5 @@
 /*
- Si_MapBalance - v3.4.0 (Web Tool Integration + !mapdump command + 2v1 layouts)
+ Si_MapBalance - v3.6.0 (Web Tool Integration + !mapdump command + 2v1 layouts + !layout pins + base site scan/check, "rot")
 
  Per-map configuration:
  - Primary: reads layout JSONs from UserData/cfg/Spawns/{MapName}/*.json (web tool output)
@@ -7,6 +7,7 @@
  - Supports per-resource-type amounts, patch_overrides, removed_patches
  - Supports per-faction settings (build radius, chain range)
  - Multiple layout files per map = random variant selection per round
+ - Admins can pin one layout per map (!layout pin, UserData/cfg/MapBalance/layout_pins.json)
  - Maps without a config are handled fully vanilla (no resource/spawn changes)
 
  Resource layout:
@@ -27,7 +28,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.4.0", "schwe")]
+[assembly: MelonInfo(typeof(Si_MapBalance.MapBalance), "Map Balance", "3.6.0", "schwe")]
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace Si_MapBalance
@@ -95,7 +96,8 @@ namespace Si_MapBalance
                 return new SpawnPos
                 {
                     X = entry["x"]?.Value<float>() ?? 0f,
-                    Z = entry["z"]?.Value<float>() ?? 0f
+                    Z = entry["z"]?.Value<float>() ?? 0f,
+                    Rot = SpawnPos.ReadRot(entry)
                 };
             }
 
@@ -113,7 +115,8 @@ namespace Si_MapBalance
             return new SpawnPos
             {
                 X = pos["x"]?.Value<float>() ?? 0f,
-                Z = pos["z"]?.Value<float>() ?? 0f
+                Z = pos["z"]?.Value<float>() ?? 0f,
+                Rot = SpawnPos.ReadRot(pos)
             };
         }
 
@@ -156,6 +159,22 @@ namespace Si_MapBalance
 
         [JsonProperty("z")]
         public float Z;
+
+        // 3.6.0: optional yaw of the base in degrees (0/90/180/270 from the tool). Null = the
+        // nearest vanilla start point's rotation, as before. Belongs to the position, so after a
+        // Sol <-> Cent swap the other faction's HQ uses it.
+        [JsonProperty("rot")]
+        public float? Rot;
+
+        internal static float? ReadRot(JToken entry)
+        {
+            var t = entry?["rot"];
+            if (t == null || (t.Type != JTokenType.Integer && t.Type != JTokenType.Float)) return null;
+            float v = t.Value<float>();
+            if (float.IsNaN(v) || float.IsInfinity(v)) return null;
+            v %= 360f;
+            return v < 0f ? v + 360f : v;
+        }
     }
 
     public class PositionEntry
@@ -249,7 +268,7 @@ namespace Si_MapBalance
         }
     }
 
-    public class MapBalance : MelonMod
+    public partial class MapBalance : MelonMod
     {
         private static bool _dumpedThisRound;
         private static List<GameObject> _spawnedAreas = new List<GameObject>();
@@ -273,6 +292,10 @@ namespace Si_MapBalance
         private static bool _activeConfigTwoVsOne;
         // The 2v1 round fell back to normal 3-way layouts (none flagged 2v1 on the map).
         private static bool _activeConfigTwoVsOneFallback;
+        // 3.5.0: the round's layout came from an admin pin (!layout pin), not the random pool.
+        private static bool _activeConfigPinned;
+        // 3.5.0: a pin exists for the map but was not used this round (why; "" = not skipped).
+        private static string _pinSkipReason = "";
         // Maps already warned about "2v1 round but no 2v1 layout" (warn once per map).
         private static readonly HashSet<string> _warnedNoTwoVsOne = new HashSet<string>();
         // The game's DistributeAllResources call arrived before the mode was
@@ -344,7 +367,8 @@ namespace Si_MapBalance
 
         public override void OnInitializeMelon()
         {
-            LoggerInstance.Msg("Si_MapBalance v3.4.0 loaded");
+            LoggerInstance.Msg("Si_MapBalance v" + ModVersion + " loaded");
+            LoadPinStore("startup");
             // UnityEngine's event rather than MelonMod.OnSceneWasLoaded: we need
             // the LoadSceneMode. Silica loads Loading + every map with
             // LoadSceneMode.Single (GameLevelLoader), so Single = new level.
@@ -625,7 +649,7 @@ namespace Si_MapBalance
                 }
                 if (helperType == null)
                 {
-                    LoggerInstance.Warning("AdminMod not found — !mapdump command disabled");
+                    LoggerInstance.Warning("AdminMod not found — !mapdump and !layout commands disabled");
                     return;
                 }
 
@@ -659,6 +683,10 @@ namespace Si_MapBalance
                     powerGeneric, "Dump map info, refinery scans, and HQ scans to UserData/MapBalance/" });
 
                 LoggerInstance.Msg("Registered !mapdump admin command via AdminMod");
+
+                // !layout (3.5.0): a real static (Player, string) handler, not a DynamicMethod
+                // shim, so Si_ModUI attributes it to this assembly and finds ModUIData().
+                RegisterLayoutCommand(LoggerInstance);
             }
             catch (Exception ex)
             {
@@ -828,6 +856,7 @@ namespace Si_MapBalance
                 float randomAngle = UnityEngine.Random.Range(0f, 360f);
                 float angleStep = activeCount > 0 ? 360f / activeCount : 0f;
                 int activeIdx = 0;
+                SiteCheckBegin(); // 3.6.0: base site warning (SiteScan.cs)
 
                 for (int i = 0; i < count; i++)
                 {
@@ -875,7 +904,7 @@ namespace Si_MapBalance
                         anyHQSpawned = true;
                         SpawnAtBestStartPoint(setup, team, startPoints, targetPos, usedPoints,
                             idxField, baseStructureField, baseStructureProp, log, teamName,
-                            useExactPosition: true);
+                            useExactPosition: true, yawOverride: spawnPos.Rot, layoutEntry: lookupFaction);
                     }
                     else
                     {
@@ -895,6 +924,7 @@ namespace Si_MapBalance
 
                     activeIdx++;
                 }
+                SiteCheckEnd(log);
 
                 // RESOURCES TOO, WHILE WE ARE HERE.
                 //
@@ -932,7 +962,8 @@ namespace Si_MapBalance
         private static void SpawnAtBestStartPoint(object setup, object team,
             List<Transform>? startPoints, Vector3 target, List<Transform> usedPoints,
             FieldInfo? idxField, FieldInfo? baseStructureField, PropertyInfo? baseStructureProp,
-            MelonLogger.Instance log, string teamName, bool useExactPosition)
+            MelonLogger.Instance log, string teamName, bool useExactPosition,
+            float? yawOverride = null, string layoutEntry = "")
         {
             if (startPoints == null || startPoints.Count == 0)
             {
@@ -984,6 +1015,14 @@ namespace Si_MapBalance
             }
 
             var rotation = bestPoint?.rotation ?? Quaternion.identity;
+            // 3.6.0: the layout's "rot" (configured positions only) replaces the start point's yaw
+            string rotSource = bestPoint != null ? $"start point '{bestPoint.name}'" : "identity";
+            if (useExactPosition && yawOverride.HasValue)
+            {
+                rotation = Quaternion.Euler(0f, yawOverride.Value, 0f);
+                rotSource = "layout rot";
+                log.Msg($"  {teamName}: rotation {yawOverride.Value:F0} from the layout's \"rot\"");
+            }
             // For configured positions: spawn at exact target coords
             // For default placement: spawn at the predefined start point's position (like the game does)
             Vector3 spawnPos = useExactPosition ? target : (bestPoint?.position ?? target);
@@ -998,6 +1037,10 @@ namespace Si_MapBalance
 
             // Raise only the HQ structure for HUMAN factions (Sol/Centauri). The alien Nest stays grounded.
             // The start point (relocated above) and its starter units stay grounded for both factions.
+            // 3.6.0: base site warning for configured positions (log only, the base is not moved)
+            if (useExactPosition)
+                SiteCheckBase(team, teamName, string.IsNullOrEmpty(layoutEntry) ? teamName : layoutEntry, spawnPos.x, spawnPos.z, rotation, rotSource, log);
+
             bool isHumanFaction = prefab.GetComponent<HumanStructure>() != null;
             Vector3 hqSpawnPos = isHumanFaction
                 ? spawnPos + new Vector3(0f, HQ_SPAWN_HEIGHT_OFFSET, 0f)
@@ -1222,6 +1265,8 @@ namespace Si_MapBalance
         {
             bool twoVsOne = IsTwoVsOneRound(gameMode, log);
             _activeConfigName = "";
+            _activeConfigPinned = false;
+            _pinSkipReason = "";
             // true until LoadMapConfig really picks from the 2v1 pool
             _activeConfigTwoVsOneFallback = twoVsOne;
             _activeConfig = LoadMapConfig(gameMode, twoVsOne);
@@ -1234,7 +1279,9 @@ namespace Si_MapBalance
             _layoutResolved = true;
 
             string tag = ModeTag(gameMode, twoVsOne);
-            if (_activeConfig != null)
+            if (_activeConfig != null && _activeConfigPinned)
+                log.Msg($"Layout pick: {_activeConfigName} (PINNED) (mode {tag}, by {by})");
+            else if (_activeConfig != null)
                 log.Msg($"Layout pick: {_activeConfigName} (mode {tag}, by {by})");
             else
                 log.Msg($"Layout pick: none, vanilla (mode {tag}, by {by})");
@@ -1264,9 +1311,7 @@ namespace Si_MapBalance
         /// Layout flagged for 2v1 rounds: "game_modes": { ..., "2v1": true }.
         /// Missing key (or false) = normal layout.
         /// </summary>
-        private static bool IsTwoVsOneLayout(JObject obj) =>
-            obj["game_modes"] is JObject gm
-            && gm["2v1"] is JToken v && v.Type == JTokenType.Boolean && v.Value<bool>();
+        private static bool IsTwoVsOneLayout(JObject obj) => LayoutPinLogic.IsTwoVsOne(obj);
 
         /// <summary>
         /// True if this round already has a pick. A pick left over from another
@@ -1404,6 +1449,8 @@ namespace Si_MapBalance
             _activeConfigPickedBy = "";
             _activeConfigTwoVsOne = false;
             _activeConfigTwoVsOneFallback = false;
+            _activeConfigPinned = false;
+            _pinSkipReason = "";
             _distributedThisRound = false;
             _pickEpoch = -1;
             _distributedEpoch = -1;
@@ -1513,7 +1560,9 @@ namespace Si_MapBalance
                         string versus = !_activeConfigTwoVsOne ? ""
                             : _activeConfigTwoVsOneFallback ? " [2v1 round, no 2v1 layout: 3-way layout]"
                             : " [2v1: Sol + Centauri vs Aliens]";
-                        string msg = $"Map Balance: {_activeConfigName}{swap}{versus}";
+                        string pin = _activeConfigPinned ? " [PINNED]"
+                            : _pinSkipReason.Length > 0 ? $" [pinned layout skipped: {_pinSkipReason}]" : "";
+                        string msg = $"Map Balance: {_activeConfigName}{swap}{versus}{pin}";
                         _sendServerChatMethod?.Invoke(null, new object[] { msg });
                         Melon<MapBalance>.Logger.Msg($"Allchat: {msg}");
                         // Write to game log so MapReplay can pick it up
@@ -1919,11 +1968,7 @@ namespace Si_MapBalance
         }
         private static readonly string LegacyConfigDir = Path.Combine("UserData", "MapBalance", "configs");
 
-        private static bool HasKohBlock(JObject obj)
-        {
-            var koh = obj["koh"];
-            return koh != null && koh.Type == JTokenType.Object;
-        }
+        private static bool HasKohBlock(JObject obj) => LayoutPinLogic.HasKoh(obj);
 
         // Pick one layout out of a candidate set, honouring the KGT operating mode.
         //   Mode 1 (full KoH)   → prefer layouts carrying a 'koh' block.
@@ -2013,9 +2058,13 @@ namespace Si_MapBalance
             {
                 var jsonFiles = Directory.GetFiles(mapSpawnsDir, "*.json");
 
+                // Admin pin (3.5.0): replaces the random pick when pinning is on, the
+                // file exists, parses and supports this round's mode; else warn + random pool.
+                configPath = TryPinnedLayout(mapName!, mapSpawnsDir, jsonFiles, gameMode, twoVsOne, log);
+
                 // 2v1 round (3.4.0): only layouts flagged "game_modes": {"2v1": true}.
                 // None on this map -> warn once, then the normal 3-way pool below.
-                if (twoVsOne)
+                if (twoVsOne && configPath == null)
                 {
                     configPath = SelectTwoVsOneLayout(jsonFiles, mapName!, log);
                     if (configPath != null)
@@ -2061,7 +2110,7 @@ namespace Si_MapBalance
 
                 if (configPath != null)
                 {
-                    // 2v1 pick made above
+                    // pinned layout or 2v1 pick made above
                 }
                 else if (matching.Count > 0)
                 {

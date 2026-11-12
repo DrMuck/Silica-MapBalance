@@ -1,5 +1,83 @@
 # Si_MapBalance — Change Log
 
+## v3.6.0 — 2026-11-12
+
+### Feature: base site test (scan, layout check, runtime warning) and the layout field `"rot"`
+- **Why**: players saw starter units spawn inside map geometry when a layout put the HQ next to a
+  cliff (Citadel) or the Nest between skyscrapers (IndustrialQuarter). The layouts come from the web
+  tool, whose HQ masks were terrain-only (`!mapdump` hq_scan): no rocks, cliff meshes, buildings,
+  navmesh, and nothing for the Nest.
+- **Site test** (`SiteTest.cs`, shared by everything below): for Sol HQ, Centauri HQ and Alien Nest
+  (the team's `BaseStructure`, sized from its prefab's solid colliders) at x/z and a yaw:
+  on the map (FogOfWar bounds); ground = the structure's own `ConstructionPreview.GetGroundSlopeClear`
+  (called, and replicated to measure how far the foundation sticks out; valid up to `GroundTol` 8 m);
+  no static collider (rocks, cliffs, buildings, props, invisible walls; not terrain, not game objects,
+  not the palms' `AIVehicleObstacle` layer) penetrating the collision boxes deeper than `OverlapDepth`
+  3 m (`Physics.ComputePenetration`); at least 2 of 8 probes around the
+  footprint on the main connected component of the site graph (`Small Vehicle` for HQs, `Voxel Graph`
+  for the Nest; the main component is tracked by a reference node because A* renumbers
+  `GraphNode.Area` after graph updates). Result = one code byte (valid bit, reason 0-7, four test
+  flags). Thresholds calibrated on all 578 vanilla start-point placements of the 13 maps: 94.9 % of
+  the HQ and 95.9 % of the Nest placements pass (see Si_MapBalanceTool `docs/SITE_SCAN.md` §9).
+  Standing on a non-terrain surface (Citadel rock plateaus, IndustrialQuarter platforms) is logged,
+  not failed: those are playable meshes; roofs and pillar tops fail the navmesh test instead.
+  For the Nest the ground rule is recorded but not a failure (11 of 266 vanilla Nest placements break
+  it: tilt from a 1 m ray triangle on rock, ray misses, gaps of 8-35 m; vanilla spawns them anyway).
+  Yaws within 0.05 deg of a multiple of 90 are snapped and the quaternion kept at w >= 0 (a start point
+  yaw of 359.99 gave 0 m penetration where yaw 0 gave 3.6 m on Citadel).
+- **Runtime warning**: when a round applies a layout, every configured base is tested before it is
+  spawned. Bad base: one Warning `[SITE] BAD BASE map=… layout=… team=… pos=(x,z) rot=… (source)
+  reason=… blocker='<collider>' [layer] (depth) …`; otherwise `[SITE] Base site check <map> <layout>:
+  all N bases clear`. Nothing is moved.
+- **`"rot"`** (optional, per spawn entry, degrees; the tool writes 0/90/180/270): the base at that
+  entry spawns with exactly this yaw. Absent = as before (the nearest vanilla start point's rotation).
+  The yaw belongs to the position, so after the 50 % Sol/Cent swap the other faction's HQ uses it: in
+  swappable layouts it has to suit both HQs. The relocated start point keeps its own rotation (not
+  rotated, so no leak into later rounds on the same scene). Older builds ignore the field.
+- **Site scan mode** (`SiteScan.cs`, `UserData/cfg/MapBalance/site_scan.json` `"enabled": true`): on
+  each map load it waits for the navmesh, scans, loads the next listed map (`NetworkGameServer.LoadLevel`
+  with the running game mode) and resumes from `state.json` after a restart. Output in
+  `UserData/MapBalance/site_scan/`: grid `site_scan_<Map>_<ts>.txt` (15 m hq_scan grid, 3 structures
+  x 4 yaws + open-ground bits for a vehicle and an alien probe), `site_startpoints_*.csv`,
+  `site_layouts_*.csv` (every base of every layout in `layouts_dir`), optional Si_StarterUnits dry run
+  (`starter_audit`, off by default; test points in `cfg/StarterUnits/audit/<Map>/`, removed after).
+  Yields every `frame_budget_ms`. Needed once per map and game version: layout checks afterwards are
+  offline (Si_MapBalanceTool `tools/site_audit.py` on `data/sites/`).
+- Build: needs `AstarPathfindingProject.dll`, `PackageTools.dll`, `Drawing.dll` in
+  `include/netstandard2.1/` (same files in 0.9.47 and 1.0.x). refcheck clean against both.
+- Small edits in `Si_MapBalance.cs` only: `SpawnPos.Rot` + `ReadRot`, two lines in `GetFactionSpawn`,
+  `SiteCheckBegin/End` around the spawn loop, `yawOverride`/`layoutEntry` parameters and the
+  `SiteCheckBase` call in `SpawnAtBestStartPoint`, version strings.
+
+## v3.5.0 — 2026-11-12
+
+### Feature: pin a layout per map (`!layout`)
+- Admins can force one layout JSON per map instead of the random pick (show matches,
+  trying a specific JSON). Pins are per map, sticky until removed, and stored with a master
+  switch in `UserData/cfg/MapBalance/layout_pins.json` (`{"pinning": true, "pins": {"<map>": "<file>.json"}}`),
+  re-read when edited by hand. `pinning off` keeps the pins but ignores them.
+- Admin command (AdminMod, power `Map`): `!layout` / `!layout status`, `!layout list [map]`,
+  `!layout pin [map] <name|#>`, `!layout unpin [map|all]`, `!layout pinning on|off`. Names match
+  case-insensitively with or without `.json`: exact name, then list number, then a unique
+  substring; ambiguous or unknown -> the candidates are listed, nothing changes. Replies say a
+  pin takes effect at the next round start (one pick per round).
+- Pick: still exactly one pick per round (`PickLayout` -> `LoadMapConfig`); the pin is checked
+  first there. Used only if the file exists, parses and supports the round's mode by the same
+  rules as the random pool (mode flag or mode-agnostic; never a 2v1 layout in a normal HvHvA
+  round; in a 2v1 round a `"2v1"` layout, or a plain `hvhva` one when the map has no 2v1
+  layout). Otherwise: Warning once per round + normal random pick, never a broken round.
+  The KoH preference does not apply to a pin; `swap_spawns` behaves as before.
+- Logs: `Layout pin for <map>: <file> [...] fits mode X — used instead of the random pick`,
+  `Layout pick: <name> (PINNED) (mode X, by Y)`, `Layout pin for <map> (<file>) NOT used: <reason>`.
+  Allchat: `Map Balance: <name> [PINNED]` or `... [pinned layout skipped: <reason>]`.
+  `map_layout` game-log line unchanged.
+- Si_ModUI export `ModUIData()` (admin only): status lines, pinning ON/OFF switch, "Pin layout
+  (this map)" picker with mode tags, "Unpin this map", "Clear all pins", list and status
+  reports. `ModUI_Export.cs` copied verbatim from Si_ModUI. `!layout` is registered with a
+  real static handler (not a DynamicMethod shim) so Si_ModUI attributes it to this assembly.
+- Code: pure logic (matching, pin store, mode check) in `LayoutPins.cs` (no Unity), command +
+  export in `LayoutPinCommands.cs`; `MapBalance` is now `partial`.
+
 ## v3.4.0 — 2026-11-08
 
 ### Feature: 2v1 layouts for Si_VersusVote rounds
